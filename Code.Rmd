@@ -1,0 +1,311 @@
+---
+title: "Regresiones"
+output: html_notebook
+---
+
+
+```{r, message=FALSE, warning=FALSE}
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(WDI)
+library(countrycode)
+library(purrr)
+library(fixest)
+library(zoo)
+library(pracma)
+
+```
+
+
+```{r}
+# -----------------------------
+# Load base
+# -----------------------------
+df <- read_csv("base_final.csv") %>%
+  mutate(
+    year = as.integer(substr(year_month, 1, 4)),
+    country = toupper(country)
+  )
+
+countries_needed <- sort(unique(df$country))
+
+# -----------------------------
+# World Bank 
+# -----------------------------
+
+wb_indicators <- c(
+  internet       = "IT.NET.USER.ZS")
+
+
+wb_list <- purrr::imap(wb_indicators, function(code, name) {
+  WDI(country = countries_needed, indicator = code) %>%
+    transmute(
+      country = toupper(iso2c),
+      year,
+      !!name := .data[[code]]
+    )
+})
+
+wb <- purrr::reduce(wb_list, full_join, by = c("country", "year"))
+
+
+# -----------------------------
+# SWIID (names -> ISO2)
+# -----------------------------
+swiid <- read_csv("swiid.csv") %>%
+  mutate(
+    country = toupper(countrycode(country, "country.name", "iso2c"))
+  ) %>%
+  filter(country %in% countries_needed) %>%
+  transmute(country, year, gini_disp, gini_mkt)
+
+# -----------------------------
+# Merge
+# -----------------------------
+df2 <- df %>%
+  left_join(wb, by = c("country", "year")) %>%
+  left_join(swiid, by = c("country", "year"))
+
+```
+
+There are two approaches, one with country-year specific effects and other with yearly control data on gdp, inequality and internet acces.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(pracma)
+
+vars_annual <- c("internet", "gini_disp", "gini_mkt")
+
+df_monthly <- df2 %>%
+  mutate(
+    ym = as.Date(paste0(year_month, "-01")),
+    t = as.numeric(ym),
+    month = as.integer(substr(year_month, 6, 7))
+  ) %>%
+  arrange(country, ym) %>%
+  group_by(country) %>%
+  mutate(
+    across(all_of(vars_annual), ~{
+      x_raw <- as.numeric(.x)
+
+
+      x <- x_raw
+      x[month != 12] <- NA_real_
+
+ 
+      dec_idx <- which(month == 12)
+      x_dec <- x[dec_idx]
+
+      last_val <- NA_real_
+      last_delta <- NA_real_
+
+      for (i in seq_along(x_dec)) {
+        if (!is.na(x_dec[i])) {
+          if (!is.na(last_val)) {
+            d <- x_dec[i] - last_val
+            if (d != 0) last_delta <- d
+          }
+          last_val <- x_dec[i]
+        } else if (!is.na(last_val)) {
+          if (is.na(last_delta)) last_delta <- 0
+          x_dec[i] <- last_val + last_delta
+          last_val <- x_dec[i]
+        }
+      }
+
+      x[dec_idx] <- x_dec
+
+     
+      keep <- !is.na(x)
+      if (sum(keep) >= 2) {
+        tt <- t[keep]
+        yy <- x[keep]
+        pchip(tt, yy, t)
+      } else {
+        x
+      }
+    })
+  ) %>%
+  ungroup() %>%
+  select(-ym, -t, -month)
+
+
+
+
+```
+
+
+```{r}
+narratives <- c(
+  "Restrictive_equal_opportunities_rate",
+  "Restrictive_fairness_rate",
+  "Restrictive_meritocracy_rate",
+  "Restrictive_redistribution_rate",
+  "Permissive_equal_opportunities_rate",
+  "Permissive_fairness_rate",
+  "Permissive_meritocracy_rate",
+  "Permissive_redistribution_rate"
+)
+
+vars_levels <- c(
+  narratives,
+  "HHI",
+  "ENP",
+  "Top1",
+  "Top3",
+  "Top5",
+  "Entropy",
+  "TailShare",
+  "internet",
+  "gini_disp",
+  "gini_mkt",
+  "G_Trends"
+)
+
+
+df_base_levels_m <- df_monthly %>%
+  mutate(year = as.integer(substr(year_month, 1, 4)))
+
+```
+
+
+
+```{r}
+run_lags_levels_m <- function(var, L_max = 12){
+
+  var_d <- paste0(var, "_d")
+
+  map_dfr(1:L_max, function(L){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[var]] - lag(.data[[var]]),
+        p_lag = lag(dN, L)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(internet),
+        !is.na(gini_disp),
+        dG != 0,
+        p_lag != 0
+      )
+
+    m <- feols(
+      dG ~ p_lag + internet + gini_disp | country^year,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(m)$coeftable
+
+    tibble(
+      variable = var,
+      lag      = L,
+      coef     = ct["p_lag", "Estimate"],
+      p_value  = ct["p_lag", "Pr(>|t|)"],
+      n        = nobs(m)
+    )
+  })
+}
+
+```
+
+
+```{r}
+all_lags_levels_m <- purrr::map_dfr(narratives, run_lags_levels_m)
+
+significant_levels_m <- all_lags_levels_m %>%
+  filter(p_value < 0.1)
+
+```
+
+
+
+
+```{r}
+iv_vars <- c("HHI", "ENP", "Top1", "Top3", "Top5", "Entropy", "TailShare")
+
+run_iv_lag <- function(variable, lag){
+
+  purrr::map_dfr(iv_vars, function(iv){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[variable]] - lag(.data[[variable]]),
+        dIV   = .data[[iv]] - lag(.data[[iv]]),
+        p_lag  = lag(dN,  lag),
+        iv_lag = lag(dIV, lag)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(iv_lag),
+        dG != 0,
+        p_lag != 0,
+        iv_lag != 0
+      )
+
+    # First stage: ΔN_{t-L} ~ ΔIV_{t-L}
+    fs <- feols(
+      p_lag ~ iv_lag | country^year + year_month,
+      data = d,
+      cluster = ~country
+    )
+
+    f_excl <- tryCatch(
+      wald(fs, "iv_lag")$stat,
+      error = function(e) NA_real_
+    )
+
+    # Second stage: ΔG_t ~ ΔN̂_{t-L}
+    ivm <- feols(
+      dG ~ 1 | country^year + year_month | p_lag ~ iv_lag,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(ivm)$coeftable
+
+    tibble(
+      variable      = variable,
+      lag           = lag,
+      instrument    = iv,
+      F_first_stage = as.numeric(f_excl),
+      coef_iv       = ct["fit_p_lag", "Estimate"],
+      p_value       = ct["fit_p_lag", "Pr(>|t|)"],
+      n             = nobs(ivm)
+    )
+  })
+}
+
+
+```
+
+```{r}
+results_iv_all <- expand.grid(
+  variable = narratives,
+  lag = 1:12,
+  stringsAsFactors = FALSE
+) %>%
+  purrr::pmap_dfr(~ run_iv_lag(..1, ..2))
+
+strong_iv_results <- results_iv_all %>%
+  filter(F_first_stage > 5, p_value < 0.1) %>%
+  arrange(desc(abs(coef_iv)))
+
+
+```
+
+

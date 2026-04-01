@@ -1,0 +1,3114 @@
+---
+title: "narratives_code_final"
+author: "sara alassaf"
+date: "2026-03-31"
+output: html_document
+---
+
+```{r}
+# -----------------------------
+# Load libraries
+# -----------------------------
+library(readr)
+library(dplyr)
+library(tidyr)
+library(WDI)
+library(countrycode)
+library(purrr)
+library(fixest)
+library(zoo)
+library(pracma)
+library(haven)
+library(lubridate)
+library(stringr)
+```
+
+```{r}
+# -----------------------------
+# Load base
+# -----------------------------
+df <- read_csv("base_final.csv") %>%
+  mutate(
+    year = as.integer(substr(year_month, 1, 4)),
+    country = toupper(country)
+  )
+
+countries_needed <- sort(unique(df$country))
+
+# -----------------------------
+# World Bank 
+# -----------------------------
+
+wb_indicators <- c(
+  internet       = "IT.NET.USER.ZS")
+
+
+wb_list <- purrr::imap(wb_indicators, function(code, name) {
+  WDI(country = countries_needed, indicator = code) %>%
+    transmute(
+      country = toupper(iso2c),
+      year,
+      !!name := .data[[code]]
+    )
+})
+
+wb <- purrr::reduce(wb_list, full_join, by = c("country", "year"))
+
+
+# -----------------------------
+# SWIID (names -> ISO2)
+# -----------------------------
+swiid <- read_csv("swiid.csv") %>%
+  mutate(
+    country = toupper(countrycode(country, "country.name", "iso2c"))
+  ) %>%
+  filter(country %in% countries_needed) %>%
+  transmute(country, year, gini_disp, gini_mkt)
+
+# -----------------------------
+# Merge
+# -----------------------------
+df2 <- df %>%
+  left_join(wb, by = c("country", "year")) %>%
+  left_join(swiid, by = c("country", "year"))
+```
+
+There are two approaches, one with country-year specific effects and other with yearly control data on gdp, inequality and internet access.
+
+```{r}
+vars_annual <- c("internet", "gini_disp", "gini_mkt")
+
+df_monthly <- df2 %>%
+  mutate(
+    ym = as.Date(paste0(year_month, "-01")),
+    t = as.numeric(ym),
+    month = as.integer(substr(year_month, 6, 7))
+  ) %>%
+  arrange(country, ym) %>%
+  group_by(country) %>%
+  mutate(
+    across(all_of(vars_annual), ~{
+      x_raw <- as.numeric(.x)
+
+
+      x <- x_raw
+      x[month != 12] <- NA_real_
+
+ 
+      dec_idx <- which(month == 12)
+      x_dec <- x[dec_idx]
+
+      last_val <- NA_real_
+      last_delta <- NA_real_
+
+      for (i in seq_along(x_dec)) {
+        if (!is.na(x_dec[i])) {
+          if (!is.na(last_val)) {
+            d <- x_dec[i] - last_val
+            if (d != 0) last_delta <- d
+          }
+          last_val <- x_dec[i]
+        } else if (!is.na(last_val)) {
+          if (is.na(last_delta)) last_delta <- 0
+          x_dec[i] <- last_val + last_delta
+          last_val <- x_dec[i]
+        }
+      }
+
+      x[dec_idx] <- x_dec
+
+     
+      keep <- !is.na(x)
+      if (sum(keep) >= 2) {
+        tt <- t[keep]
+        yy <- x[keep]
+        pchip(tt, yy, t)
+      } else {
+        x
+      }
+    })
+  ) %>%
+  ungroup() %>%
+  select(-ym, -t, -month)
+```
+
+```{r}
+narratives <- c(
+  "Restrictive_equal_opportunities_rate",
+  "Restrictive_fairness_rate",
+  "Restrictive_meritocracy_rate",
+  "Restrictive_redistribution_rate",
+  "Permissive_equal_opportunities_rate",
+  "Permissive_fairness_rate",
+  "Permissive_meritocracy_rate",
+  "Permissive_redistribution_rate"
+)
+
+vars_levels <- c(
+  narratives,
+  "HHI",
+  "ENP",
+  "Top1",
+  "Top3",
+  "Top5",
+  "Entropy",
+  "TailShare",
+  "internet",
+  "gini_disp",
+  "gini_mkt",
+  "G_Trends"
+)
+
+
+df_base_levels_m <- df_monthly %>%
+  mutate(year = as.integer(substr(year_month, 1, 4)))
+```
+
+```{r}
+run_lags_diff_m <- function(var, L_max = 12){
+
+  map_dfr(1:L_max, function(L){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[var]] - lag(.data[[var]]),
+        p_lag = lag(dN, L)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(internet),
+        !is.na(gini_disp)
+      )
+
+    m <- feols(
+      dG ~ p_lag + internet + gini_disp | country^year,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(m)$coeftable
+
+    tibble(
+      variable = var,
+      lag      = L,
+      coef     = ct["p_lag", "Estimate"],
+      p_value  = ct["p_lag", "Pr(>|t|)"],
+      n        = nobs(m),
+      spec     = "full_diff_rf"
+    )
+  })
+}
+```
+
+```{r}
+run_lags_hybrid_m <- function(var, L_max = 12){
+
+  map_dfr(1:L_max, function(L){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        N_lag = lag(.data[[var]], L)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(N_lag),
+        !is.na(internet),
+        !is.na(gini_disp)
+      )
+
+    m <- feols(
+      dG ~ N_lag + internet + gini_disp | country^year,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(m)$coeftable
+
+    tibble(
+      variable = var,
+      lag      = L,
+      coef     = ct["N_lag", "Estimate"],
+      p_value  = ct["N_lag", "Pr(>|t|)"],
+      n        = nobs(m),
+      spec     = "hybrid_rf"
+    )
+  })
+}
+```
+
+
+```{r}
+all_lags_diff_m <- purrr::map_dfr(narratives, run_lags_diff_m)
+
+all_lags_hybrid_m <- purrr::map_dfr(narratives, run_lags_hybrid_m)
+
+all_lags_compare_m <- bind_rows(
+  all_lags_diff_m,
+  all_lags_hybrid_m
+)
+
+significant_compare_m <- all_lags_compare_m %>%
+  filter(p_value < 0.1)
+```
+
+```{r}
+iv_vars <- c("HHI", "ENP", "Top1", "Top3", "Top5", "Entropy", "TailShare")
+
+run_iv_lag <- function(variable, lag){
+
+  purrr::map_dfr(iv_vars, function(iv){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[variable]] - lag(.data[[variable]]),
+        dIV   = .data[[iv]] - lag(.data[[iv]]),
+        p_lag  = lag(dN,  lag),
+        iv_lag = lag(dIV, lag)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(iv_lag)
+      )
+
+    # First stage: ΔN_{t-L} ~ ΔIV_{t-L}
+    fs <- feols(
+      p_lag ~ iv_lag | country^year + year_month,
+      data = d,
+      cluster = ~country
+    )
+
+    ct_fs <- summary(fs)$coeftable
+    t_excl <- ct_fs["iv_lag", "t value"]
+    f_excl <- as.numeric(t_excl)^2
+
+    # Second stage: ΔG_t ~ ΔN̂_{t-L}
+    ivm <- feols(
+      dG ~ 1 | country^year + year_month | p_lag ~ iv_lag,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(ivm)$coeftable
+
+    tibble(
+      variable      = variable,
+      lag           = lag,
+      instrument    = iv,
+      F_first_stage = as.numeric(f_excl),
+      coef_iv       = ct["fit_p_lag", "Estimate"],
+      p_value       = ct["fit_p_lag", "Pr(>|t|)"],
+      n             = nobs(ivm)
+    )
+  })
+}
+```
+
+```{r}
+results_iv_all <- expand.grid(
+  variable = narratives,
+  lag = 1:12,
+  stringsAsFactors = FALSE
+) %>%
+  purrr::pmap_dfr(~ run_iv_lag(..1, ..2))
+
+strong_iv_results <- results_iv_all %>%
+  filter(F_first_stage > 5, p_value < 0.1) %>%
+  arrange(desc(abs(coef_iv)))
+```
+
+The IV above is the original, and does not include cov_controls (internet, gini_disp). The version below does. Both are differenced.
+
+```{r}
+# ============================================================
+# DIFFERENCED IV (DV, endogenous regressor, and IV all differenced)
+# ============================================================
+cov_controls <- c("internet", "gini_disp")
+run_iv_lag_diff <- function(variable, lag){
+
+  purrr::map_dfr(iv_vars, function(iv){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG = G_Trends - lag(G_Trends, 1),
+        dN = .data[[variable]] - lag(.data[[variable]], 1),
+        dZ = .data[[iv]] - lag(.data[[iv]], 1),
+
+        dN_lag = lag(dN, lag),
+        dZ_lag = lag(dZ, lag)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(dN_lag),
+        !is.na(dZ_lag)
+      )
+
+    # -------------------
+    # FIRST STAGE (differences)
+    # -------------------
+
+    fs_fml <- as.formula(
+      paste0(
+        "dN_lag ~ dZ_lag",
+        if(length(cov_controls) > 0) paste0(" + ", paste(cov_controls, collapse = " + ")) else "",
+        " | country^year + year_month"
+      )
+    )
+
+    fs <- feols(
+      fs_fml,
+      data = d,
+      cluster = ~country
+    )
+
+    ct_fs  <- summary(fs)$coeftable
+    t_excl <- ct_fs["dZ_lag", "t value"]
+    F_fs   <- as.numeric(t_excl)^2
+
+    # -------------------
+    # SECOND STAGE (differences)
+    # -------------------
+
+    rhs_controls <- if(length(cov_controls) > 0) paste(cov_controls, collapse = " + ") else "1"
+
+    iv_fml <- as.formula(
+      paste0(
+        "dG ~ ", rhs_controls,
+        " | country^year + year_month",
+        " | dN_lag ~ dZ_lag"
+      )
+    )
+
+    ivm <- feols(
+      iv_fml,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(ivm)$coeftable
+
+    tibble(
+      variable      = variable,
+      lag           = lag,
+      instrument    = iv,
+      F_first_stage = F_fs,
+      coef_iv       = ct["fit_dN_lag", "Estimate"],
+      p_value       = ct["fit_dN_lag", "Pr(>|t|)"],
+      n             = nobs(ivm)
+    )
+  })
+}
+
+# Run
+iv_results_diff <- expand.grid(
+  variable = narratives,
+  lag      = 1:12,
+  stringsAsFactors = FALSE
+) %>%
+  purrr::pmap_dfr(~ run_iv_lag_diff(..1, ..2))
+
+iv_hits_diff <- iv_results_diff %>%
+  filter(F_first_stage > 10, p_value < 0.1) %>%
+  arrange(desc(F_first_stage), p_value)
+
+iv_hits_diff
+```
+
+```{r}
+# ============================================================
+# HYBRID IV (DV differenced; endogenous regressor and IV in levels)
+# ============================================================
+
+run_iv_lag_hybrid <- function(variable, lag){
+
+  purrr::map_dfr(iv_vars, function(iv){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends, 1),
+        N_lag = lag(.data[[variable]], lag),
+        Z_lag = lag(.data[[iv]], lag)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(N_lag),
+        !is.na(Z_lag)
+      )
+
+    # -------------------
+    # FIRST STAGE (levels)
+    # -------------------
+
+    fs_fml <- as.formula(
+      paste0(
+        "N_lag ~ Z_lag",
+        if(length(cov_controls) > 0) paste0(" + ", paste(cov_controls, collapse = " + ")) else "",
+        " | country^year + year_month"
+      )
+    )
+
+    fs <- feols(
+      fs_fml,
+      data = d,
+      cluster = ~country
+    )
+
+    ct_fs  <- summary(fs)$coeftable
+    t_excl <- ct_fs["Z_lag", "t value"]
+    F_fs   <- as.numeric(t_excl)^2
+
+    # -------------------
+    # SECOND STAGE (hybrid)
+    # -------------------
+
+    rhs_controls <- if(length(cov_controls) > 0) paste(cov_controls, collapse = " + ") else "1"
+
+    iv_fml <- as.formula(
+      paste0(
+        "dG ~ ", rhs_controls,
+        " | country^year + year_month",
+        " | N_lag ~ Z_lag"
+      )
+    )
+
+    ivm <- feols(
+      iv_fml,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(ivm)$coeftable
+
+    tibble(
+      variable      = variable,
+      lag           = lag,
+      instrument    = iv,
+      F_first_stage = F_fs,
+      coef_iv       = ct["fit_N_lag", "Estimate"],
+      p_value       = ct["fit_N_lag", "Pr(>|t|)"],
+      n             = nobs(ivm)
+    )
+  })
+}
+
+# Run
+iv_results_hybrid <- expand.grid(
+  variable = narratives,
+  lag      = 1:12,
+  stringsAsFactors = FALSE
+) %>%
+  purrr::pmap_dfr(~ run_iv_lag_hybrid(..1, ..2))
+
+iv_hits_hybrid <- iv_results_hybrid %>%
+  filter(F_first_stage > 10, p_value < 0.1) %>%
+  arrange(desc(F_first_stage), p_value)
+
+iv_hits_hybrid
+```
+
+Explaining the electoral comp code below:
+
+What I did with the electoral competition adjustment was to construct a separate country–month panel of political competition using the CLEA election data, and then merge that into my main dataset so I could test whether the effect of narratives on public attention depends on the electoral environment.
+
+I started by loading the two CLEA datasets, parliamentary_elections_v2.dta and presidential_elections_v2.dta, into parl_raw and pres_raw. Because different countries have different institutional structures, I created a country_map that assigns each country an election type through the system variable—either "parliamentary" or "presidential". This determines whether I use seat shares or vote shares to measure competition.
+
+For parliamentary systems, I reshaped the data using pivot_longer() on variables like party_1, seat_share_1, etc., and constructed a dataset where each row corresponds to a party within an election. I then ranked parties by seat_share, kept the top two, and computed the electoral margin as margin_pp = abs(top1_share - top2_share). For presidential systems, I followed the same logic but used vote_share1 and vote_share2, defining final_share as the second-round vote share when available, and otherwise the first round. Again, I ranked candidates, kept the top two, and computed margin_pp.
+
+I then combined these into a single dataset called election_margins, which contains iso2, election_date, top1_share, top2_share, and margin_pp. This gives me an election-level measure of political competition across all countries.
+
+Next, I constructed a full country–month panel called monthly_panel using expand_grid() over all countries in target_iso2 and all months in target_months. I merged the election data into this panel in two ways. First, I created last_election_panel, which assigns to each iso2–month_date pair the most recent election that occurred before that month. This gives me variables like last_election_date, last_election_margin_pp, and the identities and shares of the top two competitors. Second, I created next_election_panel, which assigns the next upcoming election date, stored in next_election_date.
+
+I then merged these together into a dataset called competition_merge_ready. From this, I constructed several key variables that I use in the regressions. The main continuous measure is last_election_margin_pp, which captures how competitive the most recent election was. I also created binary indicators like close_race_5pp and close_race_10pp, which equal 1 if the last election margin is below 5 or 10 percentage points. To capture timing, I constructed months_since_last_election and months_to_next_election, and an indicator election_month for whether a given month coincides with an election.
+
+After merging this dataset into my main panel df_base_levels_m, I created additional derived variables used in the regressions. In particular, I defined near_election_12m and near_election_6m as indicators for whether months_to_next_election is less than or equal to 12 or 6 months. I also created a continuous measure of competition, high_competition_cont, defined as -last_election_margin_pp, so that higher values correspond to more competitive environments.
+
+In the regressions, I kept my baseline specification in differences. That means my dependent variable is dG = G_Trends - lag(G_Trends), and my main explanatory variable is p_lag, which is the lagged change in a narrative variable, constructed as dN = Narrative - lag(Narrative) and then p_lag = lag(dN, L).
+
+To incorporate electoral competition, I estimated models where I interact p_lag with the competition variables. For example, in run_lags_diff_close_race, I estimate:
+
+dG ~ p_lag * close_race_5pp + internet + gini_disp | country^year
+
+Here, coef_p_lag captures the effect of narrative changes when close_race_5pp = 0, and coef_inter on p_lag:close_race_5pp captures how that effect changes when the last election was a close race. I run an analogous specification using near_election_12m in run_lags_diff_near_election, and a continuous version using last_election_margin_pp in run_lags_diff_margin.
+
+To interpret these properly, I also constructed comparison tables like compare_near_election, compare_close_race, and compare_margin. These combine the interaction results with baseline estimates so I can compute quantities like effect_non_election = coef_p_lag and effect_near_election = coef_p_lag + coef_inter. In the continuous case, I evaluate the effect at different levels of competition using expressions like coef_p_lag + coef_inter * 5.
+
+```{r}
+# =========================
+# Build monthly political-competition panel
+# from CLEA parliamentary + presidential .dta files
+# =========================
+
+# -------------------------
+# File paths
+# -------------------------
+parl_raw <- read_dta("parliamentary_elections_v2.dta")
+pres_raw <- read_dta("presidential_elections_v2.dta")
+
+# -------------------------
+# Your panel countries and months
+# -------------------------
+target_iso2 <- c("AU","BD","CA","GB","GH","HK","IE","IN","JM","KE",
+                 "LK","MY","NG","NZ","PH","PK","SG","TZ","US","ZA")
+
+target_months <- seq(as.Date("2011-01-01"), as.Date("2024-12-01"), by = "month")
+
+# -------------------------
+# Country mapping + system choice
+# (the election that determines executive power)
+# -------------------------
+country_map <- tibble::tribble(
+  ~iso2, ~country_name,    ~system,
+  "AU",  "Australia",      "parliamentary",
+  "BD",  "Bangladesh",     "parliamentary",
+  "CA",  "Canada",         "parliamentary",
+  "GB",  "UK",             "parliamentary",
+  "GH",  "Ghana",          "presidential",
+  "HK",  NA_character_,    "none",
+  "IE",  "Ireland",        "parliamentary",
+  "IN",  "India",          "parliamentary",
+  "JM",  "Jamaica",        "parliamentary",
+  "KE",  "Kenya",          "presidential",
+  "LK",  "Sri Lanka",      "presidential",
+  "MY",  "Malaysia",       "parliamentary",
+  "NG",  "Nigeria",        "presidential",
+  "NZ",  "New Zealand",    "parliamentary",
+  "PH",  "Philippines",    "presidential",
+  "PK",  "Pakistan",       "parliamentary",
+  "SG",  "Singapore",      "parliamentary",
+  "TZ",  "Tanzania",       "presidential",
+  "US",  "USA",            "presidential",
+  "ZA",  "S. Africa",      "parliamentary"
+)
+
+
+# -------------------------
+# Helper: robust election date
+# -------------------------
+make_election_date <- function(date_col, year_col, month_col = NULL) {
+  # Use exact date if available; otherwise fall back to year-month if month exists; else June of year
+  out <- suppressWarnings(as.Date(date_col))
+  if (!is.null(month_col)) {
+    fallback <- as.Date(sprintf("%s-%02d-01", year_col, ifelse(is.na(month_col), 6, as.integer(month_col))))
+  } else {
+    fallback <- as.Date(sprintf("%s-06-01", year_col))
+  }
+  ifelse(is.na(out), fallback, out) |> as.Date(origin = "1970-01-01")
+}
+
+# -------------------------
+# Parliamentary systems:
+# use TOP-TWO SEAT SHARE margin
+# -------------------------
+parl_keep <- country_map %>%
+  filter(system == "parliamentary") %>%
+  pull(country_name)
+
+parl_elections <- parl_raw %>%
+  filter(country %in% parl_keep) %>%
+  mutate(
+    election_id = row_number(),
+    election_date = make_election_date(date, year, month)
+  ) %>%
+  select(election_id, country, year, election_date, matches("^(party|seat_share)_[0-9]+$")) %>%
+  pivot_longer(
+    cols = matches("^(party|seat_share)_[0-9]+$"),
+    names_to = c(".value", "slot"),
+    names_pattern = "^(party|seat_share)_([0-9]+)$"
+  ) %>%
+  mutate(
+    slot = as.integer(slot),
+    seat_share = suppressWarnings(as.numeric(seat_share))
+  ) %>%
+  filter(!is.na(seat_share), seat_share > 0) %>%
+  group_by(election_id, country, year, election_date) %>%
+  arrange(desc(seat_share), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank <= 2) %>%
+  summarise(
+    top1_name = party[rank == 1][1],
+    top1_share = seat_share[rank == 1][1],
+    top2_name = party[rank == 2][1],
+    top2_share = seat_share[rank == 2][1],
+    margin_pp = abs(top1_share - top2_share),
+    metric_used = "seat_share",
+    .groups = "drop"
+  ) %>%
+  left_join(country_map %>% select(iso2, country_name), by = c("country" = "country_name")) %>%
+  select(iso2, country, election_date, year, top1_name, top1_share, top2_name, top2_share, margin_pp, metric_used)
+
+# -------------------------
+# Presidential systems:
+# use TOP-TWO VOTE SHARE margin
+# Prefer round 2 if available; otherwise use round 1
+# -------------------------
+pres_keep <- country_map %>%
+  filter(system == "presidential") %>%
+  pull(country_name)
+
+pres_elections <- pres_raw %>%
+  filter(country %in% pres_keep) %>%
+  mutate(
+    election_id = row_number(),
+    election_date = make_election_date(date, year, month)
+  ) %>%
+  select(election_id, country, year, election_date, matches("^(candidate|party|vote_share1|vote_share2)_[0-9]+$")) %>%
+  pivot_longer(
+    cols = matches("^(candidate|party|vote_share1|vote_share2)_[0-9]+$"),
+    names_to = c(".value", "slot"),
+    names_pattern = "^(candidate|party|vote_share1|vote_share2)_([0-9]+)$"
+  ) %>%
+  mutate(
+    slot = as.integer(slot),
+    vote_share1 = suppressWarnings(as.numeric(vote_share1)),
+    vote_share2 = suppressWarnings(as.numeric(vote_share2)),
+    final_share = ifelse(!is.na(vote_share2), vote_share2, vote_share1),
+    label = dplyr::coalesce(candidate, party)
+  ) %>%
+  filter(!is.na(final_share), final_share > 0) %>%
+  group_by(election_id, country, year, election_date) %>%
+  arrange(desc(final_share), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank <= 2) %>%
+  summarise(
+    top1_name = label[rank == 1][1],
+    top1_share = final_share[rank == 1][1],
+    top2_name = label[rank == 2][1],
+    top2_share = final_share[rank == 2][1],
+    margin_pp = abs(top1_share - top2_share),
+    metric_used = ifelse(any(!is.na(vote_share2)), "vote_share_round2_if_available_else_round1", "vote_share_round1"),
+    .groups = "drop"
+  ) %>%
+  left_join(country_map %>% select(iso2, country_name), by = c("country" = "country_name")) %>%
+  select(iso2, country, election_date, year, top1_name, top1_share, top2_name, top2_share, margin_pp, metric_used)
+
+# -------------------------
+# Combine election-level margins
+# -------------------------
+election_margins <- bind_rows(parl_elections, pres_elections) %>%
+  distinct(iso2, election_date, .keep_all = TRUE) %>%
+  arrange(iso2, election_date)
+
+# -------------------------
+# Build full monthly panel for all 20 countries
+# -------------------------
+monthly_panel <- tidyr::expand_grid(
+  iso2 = target_iso2,
+  month_date = target_months
+)
+
+# -------------------------
+# Last election carried forward
+# -------------------------
+last_election_panel <- monthly_panel %>%
+  left_join(election_margins, by = "iso2") %>%
+  filter(is.na(election_date) | election_date <= month_date) %>%
+  group_by(iso2, month_date) %>%
+  slice_max(order_by = election_date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(
+    iso2,
+    month_date,
+    last_election_date = election_date,
+    last_election_year = year,
+    last_top1_name = top1_name,
+    last_top1_share = top1_share,
+    last_top2_name = top2_name,
+    last_top2_share = top2_share,
+    last_election_margin_pp = margin_pp,
+    metric_used
+  )
+
+# -------------------------
+# Next election lookup
+# -------------------------
+next_election_panel <- monthly_panel %>%
+  left_join(election_margins %>% select(iso2, election_date), by = "iso2") %>%
+  filter(is.na(election_date) | election_date >= month_date) %>%
+  group_by(iso2, month_date) %>%
+  slice_min(order_by = election_date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(
+    iso2,
+    month_date,
+    next_election_date = election_date
+  )
+
+# -------------------------
+# Merge together and create competition variables
+# -------------------------
+competition_merge_ready <- monthly_panel %>%
+  left_join(last_election_panel, by = c("iso2", "month_date")) %>%
+  left_join(next_election_panel, by = c("iso2", "month_date")) %>%
+  left_join(country_map %>% select(iso2, system), by = "iso2") %>%
+  mutate(
+    months_since_last_election = ifelse(
+      !is.na(last_election_date),
+      12 * (year(month_date) - year(last_election_date)) + (month(month_date) - month(last_election_date)),
+      NA_real_
+    ),
+    months_to_next_election = ifelse(
+      !is.na(next_election_date),
+      12 * (year(next_election_date) - year(month_date)) + (month(next_election_date) - month(month_date)),
+      NA_real_
+    ),
+    election_month = ifelse(!is.na(last_election_date) & floor_date(month_date, "month") == floor_date(last_election_date, "month"), 1L, 0L),
+    close_race_5pp = ifelse(!is.na(last_election_margin_pp) & last_election_margin_pp < 5, 1L, 0L),
+    close_race_10pp = ifelse(!is.na(last_election_margin_pp) & last_election_margin_pp < 10, 1L, 0L),
+    month = format(month_date, "%Y-%m")
+  ) %>%
+  select(
+    iso2,
+    month,
+    system,
+    metric_used,
+    last_election_date,
+    next_election_date,
+    months_since_last_election,
+    months_to_next_election,
+    election_month,
+    last_top1_name,
+    last_top1_share,
+    last_top2_name,
+    last_top2_share,
+    last_election_margin_pp,
+    close_race_5pp,
+    close_race_10pp
+  ) %>%
+  arrange(iso2, month)
+
+write.csv(competition_merge_ready, "competition_merge_ready_2011_2024.csv", row.names = FALSE)
+```
+
+```{r}
+# Merge electoral comp vars in
+df_base_levels_m <- df_base_levels_m %>%
+  left_join(
+    competition_merge_ready %>%
+      rename(country = iso2, year_month = month),
+    by = c("country", "year_month")
+  )
+
+df_base_levels_m <- df_base_levels_m %>%
+  mutate(
+    close_race_5pp = as.numeric(close_race_5pp),
+    close_race_10pp = as.numeric(close_race_10pp),
+    election_month = as.numeric(election_month),
+
+    near_election_12m = ifelse(!is.na(months_to_next_election) & months_to_next_election <= 12, 1, 0),
+    near_election_6m  = ifelse(!is.na(months_to_next_election) & months_to_next_election <= 6, 1, 0),
+
+    high_competition_cont = ifelse(!is.na(last_election_margin_pp), -last_election_margin_pp, NA_real_)
+  )
+```
+
+```{r}
+# Reduced form with close race var
+run_lags_diff_close_race <- function(var, L_max = 12){
+
+  map_dfr(1:L_max, function(L){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[var]] - lag(.data[[var]]),
+        p_lag = lag(dN, L)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(close_race_5pp),
+        !is.na(internet),
+        !is.na(gini_disp)
+      )
+
+    m <- feols(
+      dG ~ p_lag * close_race_5pp + internet + gini_disp | country^year,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(m)$coeftable
+
+    tibble(
+      variable = var,
+      lag      = L,
+      coef_p_lag = ct["p_lag", "Estimate"],
+      p_p_lag    = ct["p_lag", "Pr(>|t|)"],
+      coef_inter = ct["p_lag:close_race_5pp", "Estimate"],
+      p_inter    = ct["p_lag:close_race_5pp", "Pr(>|t|)"],
+      n        = nobs(m),
+      spec     = "diff_rf_close_race"
+    )
+  })
+}
+
+results_close_race <- purrr::map_dfr(narratives, run_lags_diff_close_race)
+
+close_race_hits <- results_close_race %>%
+  filter(p_inter < 0.1) %>%
+  arrange(p_inter)
+
+close_race_hits
+```
+
+```{r}
+# -------------------------
+#  Same idea, but using "near election" instead of close race
+# -------------------------
+
+run_lags_diff_near_election <- function(var, L_max = 12){
+
+  map_dfr(1:L_max, function(L){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[var]] - lag(.data[[var]]),
+        p_lag = lag(dN, L)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(near_election_12m),
+        !is.na(internet),
+        !is.na(gini_disp)
+      )
+
+    m <- feols(
+      dG ~ p_lag * near_election_12m + internet + gini_disp | country^year,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(m)$coeftable
+
+    tibble(
+      variable   = var,
+      lag        = L,
+      coef_p_lag = ct["p_lag", "Estimate"],
+      p_p_lag    = ct["p_lag", "Pr(>|t|)"],
+      coef_inter = ct["p_lag:near_election_12m", "Estimate"],
+      p_inter    = ct["p_lag:near_election_12m", "Pr(>|t|)"],
+      n          = nobs(m),
+      spec       = "diff_rf_near_election"
+    )
+  })
+}
+
+results_near_election <- purrr::map_dfr(narratives, run_lags_diff_near_election)
+
+near_election_hits <- results_near_election %>%
+  filter(p_inter < 0.1) %>%
+  arrange(p_inter)
+
+near_election_hits
+```
+
+```{r}
+# -------------------------
+# Continuous version: smaller margin = more competitive
+# -------------------------
+
+run_lags_diff_margin <- function(var, L_max = 12){
+
+  map_dfr(1:L_max, function(L){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[var]] - lag(.data[[var]]),
+        p_lag = lag(dN, L)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(last_election_margin_pp),
+        !is.na(internet),
+        !is.na(gini_disp)
+      )
+
+    m <- feols(
+      dG ~ p_lag * last_election_margin_pp + internet + gini_disp | country^year,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(m)$coeftable
+
+    tibble(
+      variable   = var,
+      lag        = L,
+      coef_p_lag = ct["p_lag", "Estimate"],
+      p_p_lag    = ct["p_lag", "Pr(>|t|)"],
+      coef_inter = ct["p_lag:last_election_margin_pp", "Estimate"],
+      p_inter    = ct["p_lag:last_election_margin_pp", "Pr(>|t|)"],
+      n          = nobs(m),
+      spec       = "diff_rf_margin"
+    )
+  })
+}
+
+results_margin <- purrr::map_dfr(narratives, run_lags_diff_margin)
+
+margin_hits <- results_margin %>%
+  filter(p_inter < 0.1) %>%
+  arrange(p_inter)
+
+margin_hits
+```
+
+```{r}
+# -------------------------
+# Combine all election-heterogeneity results
+# -------------------------
+
+interaction_results <- bind_rows(
+  results_close_race,
+  results_near_election,
+  results_margin
+)
+
+interaction_hits <- interaction_results %>%
+  filter(p_inter < 0.1) %>%
+  arrange(spec, p_inter)
+
+interaction_hits
+```
+
+```{r}
+# -------------------------
+# Sample checks
+# -------------------------
+
+# How many countries have election competition data?
+df_base_levels_m %>%
+  summarise(
+    n_obs = n(),
+    n_close_race_nonmissing = sum(!is.na(close_race_5pp)),
+    n_margin_nonmissing = sum(!is.na(last_election_margin_pp)),
+    n_near_election_nonmissing = sum(!is.na(near_election_12m))
+  )
+
+# By country
+df_base_levels_m %>%
+  group_by(country) %>%
+  summarise(
+    n_obs = n(),
+    n_close_race_nonmissing = sum(!is.na(close_race_5pp)),
+    n_margin_nonmissing = sum(!is.na(last_election_margin_pp))
+  ) %>%
+  arrange(country)
+```
+
+
+```{r}
+# -------------------------
+# Baseline on same sample as close-race regression
+# -------------------------
+
+run_lags_diff_m_close_sample <- function(var, L_max = 12){
+
+  map_dfr(1:L_max, function(L){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[var]] - lag(.data[[var]]),
+        p_lag = lag(dN, L)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(close_race_5pp),
+        !is.na(internet),
+        !is.na(gini_disp)
+      )
+
+    m <- feols(
+      dG ~ p_lag + internet + gini_disp | country^year,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(m)$coeftable
+
+    tibble(
+      variable = var,
+      lag      = L,
+      coef     = ct["p_lag", "Estimate"],
+      p_value  = ct["p_lag", "Pr(>|t|)"],
+      n        = nobs(m),
+      spec     = "baseline_close_race_sample"
+    )
+  })
+}
+
+baseline_close_sample <- purrr::map_dfr(narratives, run_lags_diff_m_close_sample)
+
+baseline_close_sample %>%
+  filter(p_value < 0.1) %>%
+  arrange(p_value)
+
+run_lags_diff_m_near_election_sample <- function(var, L_max = 12){
+
+  map_dfr(1:L_max, function(L){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[var]] - lag(.data[[var]]),
+        p_lag = lag(dN, L)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(near_election_12m),
+        !is.na(internet),
+        !is.na(gini_disp)
+      )
+
+    m <- feols(
+      dG ~ p_lag + internet + gini_disp | country^year,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(m)$coeftable
+
+    tibble(
+      variable = var,
+      lag      = L,
+      coef     = ct["p_lag", "Estimate"],
+      p_value  = ct["p_lag", "Pr(>|t|)"],
+      n        = nobs(m),
+      spec     = "baseline_near_election_sample"
+    )
+  })
+}
+
+baseline_near_election_sample <- purrr::map_dfr(narratives, run_lags_diff_m_near_election_sample)
+
+run_lags_diff_m_margin_sample <- function(var, L_max = 12){
+
+  map_dfr(1:L_max, function(L){
+
+    d <- df_base_levels_m %>%
+      arrange(country, year_month) %>%
+      group_by(country) %>%
+      mutate(
+        dG    = G_Trends - lag(G_Trends),
+        dN    = .data[[var]] - lag(.data[[var]]),
+        p_lag = lag(dN, L)
+      ) %>%
+      ungroup() %>%
+      filter(
+        !is.na(dG),
+        !is.na(p_lag),
+        !is.na(last_election_margin_pp),
+        !is.na(internet),
+        !is.na(gini_disp)
+      )
+
+    m <- feols(
+      dG ~ p_lag + internet + gini_disp | country^year,
+      data = d,
+      cluster = ~country
+    )
+
+    ct <- summary(m)$coeftable
+
+    tibble(
+      variable = var,
+      lag      = L,
+      coef     = ct["p_lag", "Estimate"],
+      p_value  = ct["p_lag", "Pr(>|t|)"],
+      n        = nobs(m),
+      spec     = "baseline_margin_sample"
+    )
+  })
+}
+
+baseline_margin_sample <- purrr::map_dfr(narratives, run_lags_diff_m_margin_sample)
+```
+
+```{r}
+compare_near_election <- results_near_election %>%
+  left_join(
+    all_lags_diff_m %>%
+      select(variable, lag, coef_base = coef, p_base = p_value),
+    by = c("variable", "lag")
+  ) %>%
+  mutate(
+    effect_non_election = coef_p_lag,
+    effect_near_election = coef_p_lag + coef_inter
+  )
+
+compare_close_race <- results_close_race %>%
+  left_join(
+    baseline_close_sample %>%
+      select(variable, lag, coef_base = coef, p_base = p_value),
+    by = c("variable", "lag")
+  ) %>%
+  mutate(
+    effect_non_close = coef_p_lag,
+    effect_close_race = coef_p_lag + coef_inter
+  )
+
+compare_margin <- results_margin %>%
+  left_join(
+    baseline_margin_sample %>%
+      select(variable, lag, coef_base = coef, p_base = p_value),
+    by = c("variable", "lag")
+  ) %>%
+  mutate(
+    effect_high_competition = coef_p_lag + coef_inter * 5,
+    effect_medium_competition = coef_p_lag + coef_inter * 10,
+    effect_low_competition = coef_p_lag + coef_inter * 20
+  )
+```
+
+```{r}
+# -------------------------
+# LOAD TEXT-LEVEL NARRATIVE COUNTS
+# -------------------------
+
+texts_raw <- read_csv("~/Desktop/perceptions of inequality/PerArticle_REBUILT.csv", show_col_types = FALSE) %>%
+  mutate(
+    country = toupper(country),
+    month   = as.character(month)
+  ) %>%
+  filter(
+    !is.na(domain),
+    !is.na(country),
+    !is.na(month),
+    !is.na(total_sentences),
+    total_sentences > 0
+  )
+
+# -------------------------
+# AGGREGATE TO DOMAIN × COUNTRY × MONTH
+# narrative cols are already sentence counts
+# -------------------------
+
+domain_month_counts <- texts_raw %>%
+  group_by(domain, country, month) %>%
+  summarise(
+    total_sentences = sum(total_sentences, na.rm = TRUE),
+
+    Restrictive_redistribution_sent =
+      sum(Restrictive_redistribution, na.rm = TRUE),
+    Restrictive_meritocracy_sent =
+      sum(Restrictive_meritocracy, na.rm = TRUE),
+    Restrictive_equal_opportunities_sent =
+      sum(Restrictive_equal_opportunities, na.rm = TRUE),
+    Restrictive_fairness_sent =
+      sum(Restrictive_fairness, na.rm = TRUE),
+
+    Permissive_redistribution_sent =
+      sum(Permissive_redistribution, na.rm = TRUE),
+    Permissive_meritocracy_sent =
+      sum(Permissive_meritocracy, na.rm = TRUE),
+    Permissive_equal_opportunities_sent =
+      sum(Permissive_equal_opportunities, na.rm = TRUE),
+    Permissive_fairness_sent =
+      sum(Permissive_fairness, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  filter(total_sentences > 0)
+
+# -------------------------
+# HELPER: PARSE SITE VISITS
+# -------------------------
+
+parse_site_visits <- function(x) {
+  x <- tolower(trimws(as.character(x)))
+  x <- ifelse(x %in% c("", "na", "n/a", "null", "none"), NA, x)
+  x_clean <- gsub(",", "", x)
+
+  out <- rep(NA_real_, length(x_clean))
+
+  million_idx <- grepl("million", x_clean)
+  if(any(million_idx, na.rm = TRUE)){
+    nums <- suppressWarnings(as.numeric(gsub("\\s*million.*$", "", x_clean[million_idx])))
+    out[million_idx] <- nums * 1e6
+  }
+
+  plain_idx <- !million_idx & !is.na(x_clean)
+  if(any(plain_idx, na.rm = TRUE)){
+    out[plain_idx] <- suppressWarnings(as.numeric(x_clean[plain_idx]))
+  }
+
+  out
+}
+
+# -------------------------
+# READ ALL TOP-DOMAIN FILES FOR READERSHIP + OWNERSHIP
+# -------------------------
+
+readership_dir <- "~/Desktop/perceptions of inequality/Readership"
+top_domain_files <- list.files(
+  path = readership_dir,
+  pattern = "^[A-Za-z0-9]+_top_domains_for_labeling\\.csv$",
+  full.names = TRUE
+)
+
+owner_readership_raw <- map_dfr(top_domain_files, function(f){
+
+  file_name <- basename(f)
+  country_code <- toupper(str_extract(file_name, "^[A-Za-z0-9]+"))
+
+  df <- read_csv(f, show_col_types = FALSE)
+
+  names(df) <- names(df) %>%
+    str_trim() %>%
+    str_replace_all("\\s+", "_") %>%
+    str_replace_all("[()]", "") %>%
+    str_replace_all("/", "_") %>%
+    str_replace_all("-", "_")
+
+  domain_col <- names(df)[names(df) %in% c("domain", "adjudomain")]
+  if(length(domain_col) == 0) stop("No domain/adjudomain column in ", file_name)
+  domain_col <- domain_col[1]
+
+  owner_col <- names(df)[names(df) == "owner_group"]
+  if(length(owner_col) == 0) stop("No owner_group column in ", file_name)
+  owner_col <- owner_col[1]
+
+  visit_col <- names(df)[str_detect(names(df), "^site_visits")]
+  if(length(visit_col) == 0) stop("No site visits column in ", file_name)
+  visit_col <- visit_col[1]
+
+  df %>%
+    transmute(
+      country = country_code,
+      domain = as.character(.data[[domain_col]]),
+      owner_group = as.character(.data[[owner_col]]),
+      site_visits_raw = .data[[visit_col]],
+      site_visits = parse_site_visits(.data[[visit_col]])
+    )
+})
+
+owner_readership <- owner_readership_raw %>%
+  mutate(
+    country = toupper(country),
+    domain = as.character(domain),
+    owner_group = ifelse(
+      is.na(owner_group) | trimws(owner_group) == "",
+      paste0("UNKNOWN_OWNER__", domain),
+      owner_group
+    )
+  ) %>%
+  filter(!is.na(domain), !is.na(site_visits), site_visits > 0) %>%
+  group_by(country) %>%
+  mutate(
+    readership_weight = site_visits / sum(site_visits, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  distinct(country, domain, .keep_all = TRUE)
+
+# -------------------------
+# LOAD DOMAIN-LEVEL ARTICLE COUNTS
+# domain_counts.csv columns:
+# year_month, country, domain, count
+# -------------------------
+
+domain_article_counts <- read_csv("~/Desktop/perceptions of inequality/domain_counts.csv", show_col_types = FALSE) %>%
+  mutate(
+    country = toupper(country),
+    month   = as.character(year_month),
+    domain  = as.character(domain),
+    article_count = as.numeric(count)
+  ) %>%
+  select(country, month, domain, article_count) %>%
+  filter(!is.na(article_count), article_count > 0)
+
+# -------------------------
+# MERGE READERSHIP + ARTICLE COUNTS INTO DOMAIN-MONTH DATA
+# -------------------------
+
+domain_month_weighted_input <- domain_month_counts %>%
+  left_join(
+    owner_readership %>%
+      select(country, domain, owner_group, site_visits, readership_weight),
+    by = c("country", "domain")
+  ) %>%
+  left_join(
+    domain_article_counts,
+    by = c("country", "domain", "month")
+  )
+
+# Coverage checks
+coverage_summary <- domain_month_weighted_input %>%
+  group_by(country) %>%
+  summarise(
+    outlet_month_rows = n(),
+    readership_matched = sum(!is.na(readership_weight)),
+    article_count_matched = sum(!is.na(article_count)),
+    both_matched = sum(!is.na(readership_weight) & !is.na(article_count)),
+    .groups = "drop"
+  )
+
+print(coverage_summary, n = Inf)
+
+# For baseline weighting: need readership
+domain_month_weighted_input_baseline <- domain_month_weighted_input %>%
+  filter(!is.na(readership_weight), readership_weight > 0)
+
+# For discounted version: need readership + article_count
+domain_month_weighted_input_disc <- domain_month_weighted_input %>%
+  filter(
+    !is.na(readership_weight), readership_weight > 0,
+    !is.na(article_count), article_count > 0
+  )
+
+# -------------------------
+# BASELINE WEIGHTED NARRATIVES
+# -------------------------
+
+weighted_country_month_baseline <- domain_month_weighted_input_baseline %>%
+  group_by(country, month) %>%
+  summarise(
+    Restrictive_redistribution_w =
+      sum(readership_weight * Restrictive_redistribution_sent, na.rm = TRUE) /
+      sum(readership_weight * total_sentences, na.rm = TRUE),
+
+    Restrictive_meritocracy_w =
+      sum(readership_weight * Restrictive_meritocracy_sent, na.rm = TRUE) /
+      sum(readership_weight * total_sentences, na.rm = TRUE),
+
+    Restrictive_equal_opportunities_w =
+      sum(readership_weight * Restrictive_equal_opportunities_sent, na.rm = TRUE) /
+      sum(readership_weight * total_sentences, na.rm = TRUE),
+
+    Restrictive_fairness_w =
+      sum(readership_weight * Restrictive_fairness_sent, na.rm = TRUE) /
+      sum(readership_weight * total_sentences, na.rm = TRUE),
+
+    Permissive_redistribution_w =
+      sum(readership_weight * Permissive_redistribution_sent, na.rm = TRUE) /
+      sum(readership_weight * total_sentences, na.rm = TRUE),
+
+    Permissive_meritocracy_w =
+      sum(readership_weight * Permissive_meritocracy_sent, na.rm = TRUE) /
+      sum(readership_weight * total_sentences, na.rm = TRUE),
+
+    Permissive_equal_opportunities_w =
+      sum(readership_weight * Permissive_equal_opportunities_sent, na.rm = TRUE) /
+      sum(readership_weight * total_sentences, na.rm = TRUE),
+
+    Permissive_fairness_w =
+      sum(readership_weight * Permissive_fairness_sent, na.rm = TRUE) /
+      sum(readership_weight * total_sentences, na.rm = TRUE),
+
+    weighted_total_sentences_baseline =
+      sum(readership_weight * total_sentences, na.rm = TRUE),
+
+    outlets_used = n(),
+    .groups = "drop"
+  )
+
+# -------------------------
+# DISCOUNTED VERSION USING ARTICLE COUNTS
+# effective weight = readership_weight / article_count
+# -------------------------
+
+domain_month_weighted_input_disc <- domain_month_weighted_input_disc %>%
+  mutate(
+    readership_weight_per_article = readership_weight / article_count
+  )
+
+weighted_country_month_discounted <- domain_month_weighted_input_disc %>%
+  group_by(country, month) %>%
+  summarise(
+    Restrictive_redistribution_w_disc =
+      sum(readership_weight_per_article * Restrictive_redistribution_sent, na.rm = TRUE) /
+      sum(readership_weight_per_article * total_sentences, na.rm = TRUE),
+
+    Restrictive_meritocracy_w_disc =
+      sum(readership_weight_per_article * Restrictive_meritocracy_sent, na.rm = TRUE) /
+      sum(readership_weight_per_article * total_sentences, na.rm = TRUE),
+
+    Restrictive_equal_opportunities_w_disc =
+      sum(readership_weight_per_article * Restrictive_equal_opportunities_sent, na.rm = TRUE) /
+      sum(readership_weight_per_article * total_sentences, na.rm = TRUE),
+
+    Restrictive_fairness_w_disc =
+      sum(readership_weight_per_article * Restrictive_fairness_sent, na.rm = TRUE) /
+      sum(readership_weight_per_article * total_sentences, na.rm = TRUE),
+
+    Permissive_redistribution_w_disc =
+      sum(readership_weight_per_article * Permissive_redistribution_sent, na.rm = TRUE) /
+      sum(readership_weight_per_article * total_sentences, na.rm = TRUE),
+
+    Permissive_meritocracy_w_disc =
+      sum(readership_weight_per_article * Permissive_meritocracy_sent, na.rm = TRUE) /
+      sum(readership_weight_per_article * total_sentences, na.rm = TRUE),
+
+    Permissive_equal_opportunities_w_disc =
+      sum(readership_weight_per_article * Permissive_equal_opportunities_sent, na.rm = TRUE) /
+      sum(readership_weight_per_article * total_sentences, na.rm = TRUE),
+
+    Permissive_fairness_w_disc =
+      sum(readership_weight_per_article * Permissive_fairness_sent, na.rm = TRUE) /
+      sum(readership_weight_per_article * total_sentences, na.rm = TRUE),
+
+    weighted_total_sentences_discounted =
+      sum(readership_weight_per_article * total_sentences, na.rm = TRUE),
+
+    outlets_used = n(),
+    .groups = "drop"
+  )
+
+# -------------------------
+# OWNER-LEVEL CONCENTRATION USING ARTICLE-ADJUSTED EXPOSURE
+# If you want owner IVs to line up with the discounted robustness too,
+# use the same article-discounted exposure mass here.
+# -------------------------
+
+domain_month_owner_input <- domain_month_weighted_input_disc %>%
+  mutate(
+    exposure_mass_owner = readership_weight_per_article * total_sentences
+  )
+
+owner_month_mass <- domain_month_owner_input %>%
+  group_by(country, month, owner_group) %>%
+  summarise(
+    owner_exposure_mass = sum(exposure_mass_owner, na.rm = TRUE),
+    owner_total_sentences = sum(total_sentences, na.rm = TRUE),
+    outlets_in_owner = n_distinct(domain),
+    .groups = "drop"
+  )
+
+owner_month_shares <- owner_month_mass %>%
+  group_by(country, month) %>%
+  mutate(
+    total_exposure_mass_country_month = sum(owner_exposure_mass, na.rm = TRUE),
+    owner_share = owner_exposure_mass / total_exposure_mass_country_month
+  ) %>%
+  ungroup()
+
+owner_concentration_monthly <- owner_month_shares %>%
+  arrange(country, month, desc(owner_share)) %>%
+  group_by(country, month) %>%
+  mutate(rank = row_number()) %>%
+  summarise(
+    HHI_owner_w = sum(owner_share^2, na.rm = TRUE),
+    ENP_owner_w = ifelse(sum(owner_share^2, na.rm = TRUE) > 0,
+                         1 / sum(owner_share^2, na.rm = TRUE),
+                         NA_real_),
+    Top1_owner_w = sum(owner_share[rank <= 1], na.rm = TRUE),
+    Top3_owner_w = sum(owner_share[rank <= 3], na.rm = TRUE),
+    Top5_owner_w = sum(owner_share[rank <= 5], na.rm = TRUE),
+    Entropy_owner_w = -sum(ifelse(owner_share > 0, owner_share * log(owner_share), 0), na.rm = TRUE),
+    TailShare_owner_w = sum(owner_share[rank > 5], na.rm = TRUE),
+    owners_used = n(),
+    .groups = "drop"
+  )
+
+# -------------------------
+# MERGE BACK INTO MAIN PANEL
+# -------------------------
+
+df_base_levels_m_w_baseline <- df_base_levels_m %>%
+  left_join(
+    weighted_country_month_baseline %>% rename(year_month = month),
+    by = c("country", "year_month")
+  ) %>%
+  mutate(
+    Restrictive_equal_opportunities_rate_w =
+      ifelse(!is.na(Restrictive_equal_opportunities_w),
+             Restrictive_equal_opportunities_w,
+             Restrictive_equal_opportunities_rate),
+    Restrictive_fairness_rate_w =
+      ifelse(!is.na(Restrictive_fairness_w),
+             Restrictive_fairness_w,
+             Restrictive_fairness_rate),
+    Restrictive_meritocracy_rate_w =
+      ifelse(!is.na(Restrictive_meritocracy_w),
+             Restrictive_meritocracy_w,
+             Restrictive_meritocracy_rate),
+    Restrictive_redistribution_rate_w =
+      ifelse(!is.na(Restrictive_redistribution_w),
+             Restrictive_redistribution_w,
+             Restrictive_redistribution_rate),
+
+    Permissive_equal_opportunities_rate_w =
+      ifelse(!is.na(Permissive_equal_opportunities_w),
+             Permissive_equal_opportunities_w,
+             Permissive_equal_opportunities_rate),
+    Permissive_fairness_rate_w =
+      ifelse(!is.na(Permissive_fairness_w),
+             Permissive_fairness_w,
+             Permissive_fairness_rate),
+    Permissive_meritocracy_rate_w =
+      ifelse(!is.na(Permissive_meritocracy_w),
+             Permissive_meritocracy_w,
+             Permissive_meritocracy_rate),
+    Permissive_redistribution_rate_w =
+      ifelse(!is.na(Permissive_redistribution_w),
+             Permissive_redistribution_w,
+             Permissive_redistribution_rate)
+  )
+
+df_base_levels_m_w_discounted <- df_base_levels_m %>%
+  left_join(
+    weighted_country_month_discounted %>% rename(year_month = month),
+    by = c("country", "year_month")
+  ) %>%
+  mutate(
+    Restrictive_equal_opportunities_rate_w_disc =
+      ifelse(!is.na(Restrictive_equal_opportunities_w_disc),
+             Restrictive_equal_opportunities_w_disc,
+             Restrictive_equal_opportunities_rate),
+    Restrictive_fairness_rate_w_disc =
+      ifelse(!is.na(Restrictive_fairness_w_disc),
+             Restrictive_fairness_w_disc,
+             Restrictive_fairness_rate),
+    Restrictive_meritocracy_rate_w_disc =
+      ifelse(!is.na(Restrictive_meritocracy_w_disc),
+             Restrictive_meritocracy_w_disc,
+             Restrictive_meritocracy_rate),
+    Restrictive_redistribution_rate_w_disc =
+      ifelse(!is.na(Restrictive_redistribution_w_disc),
+             Restrictive_redistribution_w_disc,
+             Restrictive_redistribution_rate),
+
+    Permissive_equal_opportunities_rate_w_disc =
+      ifelse(!is.na(Permissive_equal_opportunities_w_disc),
+             Permissive_equal_opportunities_w_disc,
+             Permissive_equal_opportunities_rate),
+    Permissive_fairness_rate_w_disc =
+      ifelse(!is.na(Permissive_fairness_w_disc),
+             Permissive_fairness_w_disc,
+             Permissive_fairness_rate),
+    Permissive_meritocracy_rate_w_disc =
+      ifelse(!is.na(Permissive_meritocracy_w_disc),
+             Permissive_meritocracy_w_disc,
+             Permissive_meritocracy_rate),
+    Permissive_redistribution_rate_w_disc =
+      ifelse(!is.na(Permissive_redistribution_w_disc),
+             Permissive_redistribution_w_disc,
+             Permissive_redistribution_rate)
+  )
+
+df_base_levels_m_owner_w <- df_base_levels_m %>%
+  left_join(
+    owner_concentration_monthly %>% rename(year_month = month),
+    by = c("country", "year_month")
+  )
+
+write_csv(weighted_country_month_baseline, "weighted_country_month_baseline.csv")
+write_csv(weighted_country_month_discounted, "weighted_country_month_discounted.csv")
+write_csv(owner_concentration_monthly, "owner_concentration_monthly.csv")
+```
+
+```{r}
+# -------------------------
+# BUILD FINAL REGRESSION PANELS
+# -------------------------
+
+# Baseline narratives + owner IVs
+df_weighted_owner_baseline <- df_base_levels_m_w_baseline %>%
+  left_join(
+    owner_concentration_monthly %>%
+      rename(year_month = month),
+    by = c("country", "year_month")
+  )
+
+# Discounted narratives + owner IVs
+df_weighted_owner_discounted <- df_base_levels_m_w_discounted %>%
+  left_join(
+    owner_concentration_monthly %>%
+      rename(year_month = month),
+    by = c("country", "year_month")
+  )
+
+# -------------------------
+# VARIABLE LISTS
+# -------------------------
+
+weighted_narratives_baseline <- c(
+  "Restrictive_equal_opportunities_rate_w",
+  "Restrictive_fairness_rate_w",
+  "Restrictive_meritocracy_rate_w",
+  "Restrictive_redistribution_rate_w",
+  "Permissive_equal_opportunities_rate_w",
+  "Permissive_fairness_rate_w",
+  "Permissive_meritocracy_rate_w",
+  "Permissive_redistribution_rate_w"
+)
+
+weighted_narratives_discounted <- c(
+  "Restrictive_equal_opportunities_rate_w_disc",
+  "Restrictive_fairness_rate_w_disc",
+  "Restrictive_meritocracy_rate_w_disc",
+  "Restrictive_redistribution_rate_w_disc",
+  "Permissive_equal_opportunities_rate_w_disc",
+  "Permissive_fairness_rate_w_disc",
+  "Permissive_meritocracy_rate_w_disc",
+  "Permissive_redistribution_rate_w_disc"
+)
+
+owner_iv_vars <- c(
+  "HHI_owner_w",
+  "ENP_owner_w",
+  "Top1_owner_w",
+  "Top3_owner_w",
+  "Top5_owner_w",
+  "Entropy_owner_w",
+  "TailShare_owner_w"
+)
+
+# -------------------------
+# HELPER LABEL FUNCTION
+# -------------------------
+
+label_results <- function(df, variable_col = "variable") {
+  df %>%
+    mutate(
+      narrative = case_when(
+        grepl("equal_opportunities", .data[[variable_col]]) ~ "equal_opportunities",
+        grepl("fairness", .data[[variable_col]]) ~ "fairness",
+        grepl("meritocracy", .data[[variable_col]]) ~ "meritocracy",
+        grepl("redistribution", .data[[variable_col]]) ~ "redistribution"
+      ),
+      type = case_when(
+        grepl("Restrictive", .data[[variable_col]]) ~ "restrictive",
+        grepl("Permissive", .data[[variable_col]]) ~ "permissive"
+      )
+    )
+}
+
+# -------------------------
+# NARRATIVE OLS ONLY
+# dG on lagged dN
+# -------------------------
+
+run_narrative_ols_safe <- function(data_panel, variable, lag){
+
+  d <- data_panel %>%
+    arrange(country, year_month) %>%
+    group_by(country) %>%
+    mutate(
+      dG    = G_Trends - lag(G_Trends),
+      dN    = .data[[variable]] - lag(.data[[variable]]),
+      p_lag = lag(dN, lag)
+    ) %>%
+    ungroup() %>%
+    filter(
+      !is.na(dG),
+      !is.na(p_lag)
+    )
+
+  if(nrow(d) < 30){
+    return(tibble(
+      variable = variable,
+      lag = lag,
+      coef = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "too_few_obs"
+    ))
+  }
+
+  m <- tryCatch(
+    feols(
+      dG ~ p_lag | country^year,
+      data = d,
+      cluster = ~country
+    ),
+    error = function(e) NULL
+  )
+
+  if(is.null(m)){
+    return(tibble(
+      variable = variable,
+      lag = lag,
+      coef = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "failed"
+    ))
+  }
+
+  ct <- tryCatch(summary(m)$coeftable, error = function(e) NULL)
+
+  if(is.null(ct) || !("p_lag" %in% rownames(ct))){
+    return(tibble(
+      variable = variable,
+      lag = lag,
+      coef = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "no_coef"
+    ))
+  }
+
+  tibble(
+    variable = variable,
+    lag = lag,
+    coef = ct["p_lag", "Estimate"],
+    p_value = ct["p_lag", "Pr(>|t|)"],
+    n = nrow(d),
+    status = "ok"
+  )
+}
+
+# -------------------------
+# BASELINE WEIGHTED NARRATIVE OLS
+# -------------------------
+
+narrative_ols_baseline <- expand.grid(
+  variable = weighted_narratives_baseline,
+  lag = 1:12,
+  stringsAsFactors = FALSE
+) %>%
+  pmap_dfr(~ run_narrative_ols_safe(df_weighted_owner_baseline, ..1, ..2))
+
+narrative_ols_baseline_hits <- narrative_ols_baseline %>%
+  filter(status == "ok", p_value < 0.1) %>%
+  label_results() %>%
+  mutate(
+    coef = round(coef, 3),
+    p_value = round(p_value, 3)
+  ) %>%
+  select(narrative, type, lag, coef, p_value, n) %>%
+  arrange(p_value)
+
+narrative_ols_baseline_hits
+
+# -------------------------
+# DISCOUNTED WEIGHTED NARRATIVE OLS
+# -------------------------
+
+narrative_ols_discounted <- expand.grid(
+  variable = weighted_narratives_discounted,
+  lag = 1:12,
+  stringsAsFactors = FALSE
+) %>%
+  pmap_dfr(~ run_narrative_ols_safe(df_weighted_owner_discounted, ..1, ..2))
+
+narrative_ols_discounted_hits <- narrative_ols_discounted %>%
+  filter(status == "ok", p_value < 0.1) %>%
+  label_results() %>%
+  mutate(
+    coef = round(coef, 3),
+    p_value = round(p_value, 3)
+  ) %>%
+  select(narrative, type, lag, coef, p_value, n) %>%
+  arrange(p_value)
+
+narrative_ols_discounted_hits
+
+# -------------------------
+# REDUCED FORM
+# dG on lagged dIV
+# -------------------------
+
+run_rf_safe <- function(data_panel, iv, lag){
+
+  d <- data_panel %>%
+    arrange(country, year_month) %>%
+    group_by(country) %>%
+    mutate(
+      dG     = G_Trends - lag(G_Trends),
+      dIV    = .data[[iv]] - lag(.data[[iv]]),
+      iv_lag = lag(dIV, lag)
+    ) %>%
+    ungroup() %>%
+    filter(
+      !is.na(dG),
+      !is.na(iv_lag)
+    )
+
+  if(nrow(d) < 30){
+    return(tibble(
+      instrument = iv,
+      lag = lag,
+      coef_rf = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "too_few_obs"
+    ))
+  }
+
+  m <- tryCatch(
+    feols(
+      dG ~ iv_lag | country^year + year_month,
+      data = d,
+      cluster = ~country
+    ),
+    error = function(e) NULL
+  )
+
+  if(is.null(m)){
+    return(tibble(
+      instrument = iv,
+      lag = lag,
+      coef_rf = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "failed"
+    ))
+  }
+
+  ct <- tryCatch(summary(m)$coeftable, error = function(e) NULL)
+
+  if(is.null(ct) || !("iv_lag" %in% rownames(ct))){
+    return(tibble(
+      instrument = iv,
+      lag = lag,
+      coef_rf = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "no_coef"
+    ))
+  }
+
+  tibble(
+    instrument = iv,
+    lag = lag,
+    coef_rf = ct["iv_lag", "Estimate"],
+    p_value = ct["iv_lag", "Pr(>|t|)"],
+    n = nrow(d),
+    status = "ok"
+  )
+}
+
+# -------------------------
+# DIFFERENCED IV
+# dG on lagged dN instrumented by lagged dIV
+# -------------------------
+
+run_iv_safe <- function(data_panel, variable, iv, lag){
+
+  d <- data_panel %>%
+    arrange(country, year_month) %>%
+    group_by(country) %>%
+    mutate(
+      dG     = G_Trends - lag(G_Trends),
+      dN     = .data[[variable]] - lag(.data[[variable]]),
+      dIV    = .data[[iv]] - lag(.data[[iv]]),
+      p_lag  = lag(dN, lag),
+      iv_lag = lag(dIV, lag)
+    ) %>%
+    ungroup() %>%
+    filter(
+      !is.na(dG),
+      !is.na(p_lag),
+      !is.na(iv_lag)
+    )
+
+  if(nrow(d) < 30){
+    return(tibble(
+      variable = variable,
+      lag = lag,
+      instrument = iv,
+      F_first_stage = NA_real_,
+      coef_iv = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "too_few_obs"
+    ))
+  }
+
+  fs <- tryCatch(
+    feols(
+      p_lag ~ iv_lag | country^year + year_month,
+      data = d,
+      cluster = ~country
+    ),
+    error = function(e) NULL
+  )
+
+  if(is.null(fs)){
+    return(tibble(
+      variable = variable,
+      lag = lag,
+      instrument = iv,
+      F_first_stage = NA_real_,
+      coef_iv = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "first_stage_failed"
+    ))
+  }
+
+  ct_fs <- tryCatch(summary(fs)$coeftable, error = function(e) NULL)
+
+  if(is.null(ct_fs) || !("iv_lag" %in% rownames(ct_fs))){
+    return(tibble(
+      variable = variable,
+      lag = lag,
+      instrument = iv,
+      F_first_stage = NA_real_,
+      coef_iv = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "no_first_stage_coef"
+    ))
+  }
+
+  t_excl <- ct_fs["iv_lag", "t value"]
+  F_fs   <- as.numeric(t_excl)^2
+
+  ivm <- tryCatch(
+    feols(
+      dG ~ 1 | country^year + year_month | p_lag ~ iv_lag,
+      data = d,
+      cluster = ~country
+    ),
+    error = function(e) NULL
+  )
+
+  if(is.null(ivm)){
+    return(tibble(
+      variable = variable,
+      lag = lag,
+      instrument = iv,
+      F_first_stage = F_fs,
+      coef_iv = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "second_stage_failed"
+    ))
+  }
+
+  ct <- tryCatch(summary(ivm)$coeftable, error = function(e) NULL)
+
+  if(is.null(ct) || !("fit_p_lag" %in% rownames(ct))){
+    return(tibble(
+      variable = variable,
+      lag = lag,
+      instrument = iv,
+      F_first_stage = F_fs,
+      coef_iv = NA_real_,
+      p_value = NA_real_,
+      n = nrow(d),
+      status = "no_second_stage_coef"
+    ))
+  }
+
+  tibble(
+    variable = variable,
+    lag = lag,
+    instrument = iv,
+    F_first_stage = F_fs,
+    coef_iv = ct["fit_p_lag", "Estimate"],
+    p_value = ct["fit_p_lag", "Pr(>|t|)"],
+    n = nrow(d),
+    status = "ok"
+  )
+}
+
+# -------------------------
+# RUN REDUCED FORM: BASELINE
+# -------------------------
+
+rf_owner_weighted_baseline <- expand.grid(
+  instrument = owner_iv_vars,
+  lag = 1:12,
+  stringsAsFactors = FALSE
+) %>%
+  pmap_dfr(~ run_rf_safe(df_weighted_owner_baseline, ..1, ..2))
+
+rf_owner_weighted_baseline_hits <- rf_owner_weighted_baseline %>%
+  filter(status == "ok", p_value < 0.1) %>%
+  arrange(p_value)
+
+# -------------------------
+# RUN REDUCED FORM: DISCOUNTED
+# -------------------------
+
+rf_owner_weighted_discounted <- expand.grid(
+  instrument = owner_iv_vars,
+  lag = 1:12,
+  stringsAsFactors = FALSE
+) %>%
+  pmap_dfr(~ run_rf_safe(df_weighted_owner_discounted, ..1, ..2))
+
+rf_owner_weighted_discounted_hits <- rf_owner_weighted_discounted %>%
+  filter(status == "ok", p_value < 0.1) %>%
+  arrange(p_value)
+
+# -------------------------
+# RUN IV: BASELINE
+# -------------------------
+
+results_iv_owner_weighted_baseline <- expand.grid(
+  variable = weighted_narratives_baseline,
+  lag = 1:12,
+  instrument = owner_iv_vars,
+  stringsAsFactors = FALSE
+) %>%
+  pmap_dfr(~ run_iv_safe(df_weighted_owner_baseline, ..1, ..3, ..2))
+
+strong_iv_owner_weighted_baseline <- results_iv_owner_weighted_baseline %>%
+  filter(status == "ok", F_first_stage > 5, p_value < 0.1) %>%
+  arrange(desc(F_first_stage), p_value)
+
+iv_owner_weighted_baseline_summary <- strong_iv_owner_weighted_baseline %>%
+  label_results() %>%
+  mutate(
+    coef = round(coef_iv, 3),
+    p_value = round(p_value, 3),
+    F_stat = round(F_first_stage, 2)
+  ) %>%
+  select(narrative, type, lag, instrument, coef, p_value, F_stat, n) %>%
+  arrange(desc(F_stat), p_value)
+
+# -------------------------
+# RUN IV: DISCOUNTED
+# -------------------------
+
+results_iv_owner_weighted_discounted <- expand.grid(
+  variable = weighted_narratives_discounted,
+  lag = 1:12,
+  instrument = owner_iv_vars,
+  stringsAsFactors = FALSE
+) %>%
+  pmap_dfr(~ run_iv_safe(df_weighted_owner_discounted, ..1, ..3, ..2))
+
+strong_iv_owner_weighted_discounted <- results_iv_owner_weighted_discounted %>%
+  filter(status == "ok", F_first_stage > 5, p_value < 0.1) %>%
+  arrange(desc(F_first_stage), p_value)
+
+iv_owner_weighted_discounted_summary <- strong_iv_owner_weighted_discounted %>%
+  label_results() %>%
+  mutate(
+    coef = round(coef_iv, 3),
+    p_value = round(p_value, 3),
+    F_stat = round(F_first_stage, 2)
+  ) %>%
+  select(narrative, type, lag, instrument, coef, p_value, F_stat, n) %>%
+  arrange(desc(F_stat), p_value)
+
+# -------------------------
+# OVERLAP TABLE: SURVIVES IN BOTH
+# -------------------------
+
+baseline_clean <- strong_iv_owner_weighted_baseline %>%
+  label_results() %>%
+  select(narrative, type, lag, instrument,
+         coef_base = coef_iv,
+         p_base = p_value,
+         F_base = F_first_stage)
+
+discounted_clean <- strong_iv_owner_weighted_discounted %>%
+  label_results() %>%
+  select(narrative, type, lag, instrument,
+         coef_disc = coef_iv,
+         p_disc = p_value,
+         F_disc = F_first_stage)
+
+robust_iv_specs <- baseline_clean %>%
+  inner_join(
+    discounted_clean,
+    by = c("narrative", "type", "lag", "instrument")
+  ) %>%
+  mutate(
+    coef_base = round(coef_base, 3),
+    coef_disc = round(coef_disc, 3),
+    p_base    = round(p_base, 3),
+    p_disc    = round(p_disc, 3),
+    F_base    = round(F_base, 2),
+    F_disc    = round(F_disc, 2),
+    coef_diff = round(coef_disc - coef_base, 3)
+  ) %>%
+  arrange(desc(F_base), desc(F_disc))
+
+robust_iv_summary <- robust_iv_specs %>%
+  select(
+    narrative, type, lag, instrument,
+    coef_base, coef_disc,
+    F_base, F_disc,
+    p_base, p_disc
+  )
+
+write.csv(rf_owner_weighted_baseline, "rf_owner_weighted_baseline.csv", row.names = FALSE)
+write.csv(rf_owner_weighted_discounted, "rf_owner_weighted_discounted.csv", row.names = FALSE)
+
+write.csv(results_iv_owner_weighted_baseline, "results_iv_owner_weighted_baseline.csv", row.names = FALSE)
+write.csv(results_iv_owner_weighted_discounted, "results_iv_owner_weighted_discounted.csv", row.names = FALSE)
+
+write.csv(iv_owner_weighted_baseline_summary, "iv_owner_weighted_baseline_summary.csv", row.names = FALSE)
+write.csv(iv_owner_weighted_discounted_summary, "iv_owner_weighted_discounted_summary.csv", row.names = FALSE)
+
+write.csv(robust_iv_summary, "robust_iv_summary.csv", row.names = FALSE)
+```
+
+```{r}
+country_map <- tibble::tribble(
+  ~iso2, ~country_name,    ~system,
+  "AU",  "Australia",      "parliamentary",
+  "BD",  "Bangladesh",     "parliamentary",
+  "CA",  "Canada",         "parliamentary",
+  "GB",  "UK",             "parliamentary",
+  "GH",  "Ghana",          "presidential",
+  "HK",  NA_character_,    "none",
+  "IE",  "Ireland",        "parliamentary",
+  "IN",  "India",          "parliamentary",
+  "JM",  "Jamaica",        "parliamentary",
+  "KE",  "Kenya",          "presidential",
+  "LK",  "Sri Lanka",      "presidential",
+  "MY",  "Malaysia",       "parliamentary",
+  "NG",  "Nigeria",        "presidential",
+  "NZ",  "New Zealand",    "parliamentary",
+  "PH",  "Philippines",    "presidential",
+  "PK",  "Pakistan",       "parliamentary",
+  "SG",  "Singapore",      "parliamentary",
+  "TZ",  "Tanzania",       "presidential",
+  "US",  "USA",            "presidential",
+  "ZA",  "S. Africa",      "parliamentary"
+)
+
+target_iso2 <- c("AU","BD","CA","GB","GH","HK","IE","IN","JM","KE",
+                 "LK","MY","NG","NZ","PH","PK","SG","TZ","US","ZA")
+
+target_months <- seq(as.Date("2011-01-01"), as.Date("2024-12-01"), by = "month")
+
+make_election_date <- function(date_col, year_col, month_col = NULL) {
+  out <- suppressWarnings(as.Date(date_col))
+  if (!is.null(month_col)) {
+    fallback <- as.Date(sprintf("%s-%02d-01", year_col, ifelse(is.na(month_col), 6, as.integer(month_col))))
+  } else {
+    fallback <- as.Date(sprintf("%s-06-01", year_col))
+  }
+  ifelse(is.na(out), fallback, out) |> as.Date(origin = "1970-01-01")
+}
+
+parl_raw <- read_dta("parliamentary_elections_v2.dta")
+pres_raw <- read_dta("presidential_elections_v2.dta")
+
+parl_keep <- country_map %>%
+  filter(system == "parliamentary") %>%
+  pull(country_name)
+
+parl_elections <- parl_raw %>%
+  filter(country %in% parl_keep) %>%
+  mutate(
+    election_id = row_number(),
+    election_date = make_election_date(date, year, month)
+  ) %>%
+  select(election_id, country, year, election_date, matches("^(party|seat_share)_[0-9]+$")) %>%
+  pivot_longer(
+    cols = matches("^(party|seat_share)_[0-9]+$"),
+    names_to = c(".value", "slot"),
+    names_pattern = "^(party|seat_share)_([0-9]+)$"
+  ) %>%
+  mutate(
+    slot = as.integer(slot),
+    seat_share = suppressWarnings(as.numeric(seat_share))
+  ) %>%
+  filter(!is.na(seat_share), seat_share > 0) %>%
+  group_by(election_id, country, year, election_date) %>%
+  arrange(desc(seat_share), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank <= 2) %>%
+  summarise(
+    top1_name = party[rank == 1][1],
+    top1_share = seat_share[rank == 1][1],
+    top2_name = party[rank == 2][1],
+    top2_share = seat_share[rank == 2][1],
+    margin_pp = abs(top1_share - top2_share),
+    metric_used = "seat_share",
+    .groups = "drop"
+  ) %>%
+  left_join(country_map %>% select(iso2, country_name), by = c("country" = "country_name")) %>%
+  select(iso2, country, election_date, year, top1_name, top1_share, top2_name, top2_share, margin_pp, metric_used)
+
+pres_keep <- country_map %>%
+  filter(system == "presidential") %>%
+  pull(country_name)
+
+pres_elections <- pres_raw %>%
+  filter(country %in% pres_keep) %>%
+  mutate(
+    election_id = row_number(),
+    election_date = make_election_date(date, year, month)
+  ) %>%
+  select(election_id, country, year, election_date, matches("^(candidate|party|vote_share1|vote_share2)_[0-9]+$")) %>%
+  pivot_longer(
+    cols = matches("^(candidate|party|vote_share1|vote_share2)_[0-9]+$"),
+    names_to = c(".value", "slot"),
+    names_pattern = "^(candidate|party|vote_share1|vote_share2)_([0-9]+)$"
+  ) %>%
+  mutate(
+    slot = as.integer(slot),
+    vote_share1 = suppressWarnings(as.numeric(vote_share1)),
+    vote_share2 = suppressWarnings(as.numeric(vote_share2)),
+    final_share = ifelse(!is.na(vote_share2), vote_share2, vote_share1),
+    label = dplyr::coalesce(candidate, party)
+  ) %>%
+  filter(!is.na(final_share), final_share > 0) %>%
+  group_by(election_id, country, year, election_date) %>%
+  arrange(desc(final_share), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank <= 2) %>%
+  summarise(
+    top1_name = label[rank == 1][1],
+    top1_share = final_share[rank == 1][1],
+    top2_name = label[rank == 2][1],
+    top2_share = final_share[rank == 2][1],
+    margin_pp = abs(top1_share - top2_share),
+    metric_used = ifelse(any(!is.na(vote_share2)), "vote_share_round2_if_available_else_round1", "vote_share_round1"),
+    .groups = "drop"
+  ) %>%
+  left_join(country_map %>% select(iso2, country_name), by = c("country" = "country_name")) %>%
+  select(iso2, country, election_date, year, top1_name, top1_share, top2_name, top2_share, margin_pp, metric_used)
+
+election_margins <- bind_rows(parl_elections, pres_elections) %>%
+  distinct(iso2, election_date, .keep_all = TRUE) %>%
+  arrange(iso2, election_date)
+
+monthly_panel <- tidyr::expand_grid(
+  iso2 = target_iso2,
+  month_date = target_months
+)
+
+last_election_panel <- monthly_panel %>%
+  left_join(election_margins, by = "iso2") %>%
+  filter(is.na(election_date) | election_date <= month_date) %>%
+  group_by(iso2, month_date) %>%
+  slice_max(order_by = election_date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(
+    iso2,
+    month_date,
+    last_election_date = election_date,
+    last_election_year = year,
+    last_top1_name = top1_name,
+    last_top1_share = top1_share,
+    last_top2_name = top2_name,
+    last_top2_share = top2_share,
+    last_election_margin_pp = margin_pp,
+    metric_used
+  )
+
+next_election_panel <- monthly_panel %>%
+  left_join(election_margins %>% select(iso2, election_date), by = "iso2") %>%
+  filter(is.na(election_date) | election_date >= month_date) %>%
+  group_by(iso2, month_date) %>%
+  slice_min(order_by = election_date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(
+    iso2,
+    month_date,
+    next_election_date = election_date
+  )
+
+competition_merge_ready <- monthly_panel %>%
+  left_join(last_election_panel, by = c("iso2", "month_date")) %>%
+  left_join(next_election_panel, by = c("iso2", "month_date")) %>%
+  left_join(country_map %>% select(iso2, system), by = "iso2") %>%
+  mutate(
+    months_since_last_election = ifelse(
+      !is.na(last_election_date),
+      12 * (year(month_date) - year(last_election_date)) + (month(month_date) - month(last_election_date)),
+      NA_real_
+    ),
+    months_to_next_election = ifelse(
+      !is.na(next_election_date),
+      12 * (year(next_election_date) - year(month_date)) + (month(next_election_date) - month(month_date)),
+      NA_real_
+    ),
+    election_month = ifelse(!is.na(last_election_date) & floor_date(month_date, "month") == floor_date(last_election_date, "month"), 1L, 0L),
+    close_race_5pp = ifelse(!is.na(last_election_margin_pp) & last_election_margin_pp < 5, 1L, 0L),
+    close_race_10pp = ifelse(!is.na(last_election_margin_pp) & last_election_margin_pp < 10, 1L, 0L),
+    month = format(month_date, "%Y-%m")
+  ) %>%
+  select(
+    iso2,
+    month,
+    system,
+    metric_used,
+    last_election_date,
+    next_election_date,
+    months_since_last_election,
+    months_to_next_election,
+    election_month,
+    last_top1_name,
+    last_top1_share,
+    last_top2_name,
+    last_top2_share,
+    last_election_margin_pp,
+    close_race_5pp,
+    close_race_10pp
+  ) %>%
+  arrange(iso2, month)
+
+write.csv(competition_merge_ready, "competition_merge_ready_2011_2024.csv", row.names = FALSE)
+
+df_weighted_owner_baseline_ec <- df_weighted_owner_baseline %>%
+  left_join(
+    competition_merge_ready %>%
+      rename(country = iso2, year_month = month),
+    by = c("country", "year_month")
+  ) %>%
+  mutate(
+    close_race_5pp = as.numeric(close_race_5pp),
+    close_race_10pp = as.numeric(close_race_10pp),
+    election_month = as.numeric(election_month),
+    near_election_12m = ifelse(!is.na(months_to_next_election) & months_to_next_election <= 12, 1, 0),
+    near_election_6m = ifelse(!is.na(months_to_next_election) & months_to_next_election <= 6, 1, 0),
+    high_competition_cont = ifelse(!is.na(last_election_margin_pp), -last_election_margin_pp, NA_real_)
+  )
+
+df_weighted_owner_discounted_ec <- df_weighted_owner_discounted %>%
+  left_join(
+    competition_merge_ready %>%
+      rename(country = iso2, year_month = month),
+    by = c("country", "year_month")
+  ) %>%
+  mutate(
+    close_race_5pp = as.numeric(close_race_5pp),
+    close_race_10pp = as.numeric(close_race_10pp),
+    election_month = as.numeric(election_month),
+    near_election_12m = ifelse(!is.na(months_to_next_election) & months_to_next_election <= 12, 1, 0),
+    near_election_6m = ifelse(!is.na(months_to_next_election) & months_to_next_election <= 6, 1, 0),
+    high_competition_cont = ifelse(!is.na(last_election_margin_pp), -last_election_margin_pp, NA_real_)
+  )
+
+run_lags_diff_close_race_interaction <- function(data_panel, vars, L_max = 12, spec_name = "close_race") {
+  purrr::map_dfr(vars, function(var) {
+    purrr::map_dfr(1:L_max, function(L) {
+      d <- data_panel %>%
+        arrange(country, year_month) %>%
+        group_by(country) %>%
+        mutate(
+          dG = G_Trends - lag(G_Trends),
+          dN = .data[[var]] - lag(.data[[var]]),
+          p_lag = lag(dN, L)
+        ) %>%
+        ungroup() %>%
+        filter(
+          !is.na(dG),
+          !is.na(p_lag),
+          !is.na(close_race_5pp)
+        )
+
+      if(nrow(d) < 30){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef_p_lag = NA_real_,
+          p_p_lag = NA_real_,
+          coef_inter = NA_real_,
+          p_inter = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "too_few_obs"
+        ))
+      }
+
+      m <- tryCatch(
+        feols(
+          dG ~ p_lag * close_race_5pp | country^year,
+          data = d,
+          cluster = ~country
+        ),
+        error = function(e) NULL
+      )
+
+      if(is.null(m)){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef_p_lag = NA_real_,
+          p_p_lag = NA_real_,
+          coef_inter = NA_real_,
+          p_inter = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "failed"
+        ))
+      }
+
+      ct <- tryCatch(summary(m)$coeftable, error = function(e) NULL)
+
+      if(is.null(ct) || !("p_lag" %in% rownames(ct)) || !("p_lag:close_race_5pp" %in% rownames(ct))){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef_p_lag = NA_real_,
+          p_p_lag = NA_real_,
+          coef_inter = NA_real_,
+          p_inter = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "no_coef"
+        ))
+      }
+
+      tibble(
+        variable = var,
+        lag = L,
+        coef_p_lag = ct["p_lag", "Estimate"],
+        p_p_lag = ct["p_lag", "Pr(>|t|)"],
+        coef_inter = ct["p_lag:close_race_5pp", "Estimate"],
+        p_inter = ct["p_lag:close_race_5pp", "Pr(>|t|)"],
+        n = nrow(d),
+        spec = spec_name,
+        status = "ok"
+      )
+    })
+  })
+}
+
+run_lags_diff_near_election_interaction <- function(data_panel, vars, L_max = 12, spec_name = "near_election") {
+  purrr::map_dfr(vars, function(var) {
+    purrr::map_dfr(1:L_max, function(L) {
+      d <- data_panel %>%
+        arrange(country, year_month) %>%
+        group_by(country) %>%
+        mutate(
+          dG = G_Trends - lag(G_Trends),
+          dN = .data[[var]] - lag(.data[[var]]),
+          p_lag = lag(dN, L)
+        ) %>%
+        ungroup() %>%
+        filter(
+          !is.na(dG),
+          !is.na(p_lag),
+          !is.na(near_election_12m)
+        )
+
+      if(nrow(d) < 30){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef_p_lag = NA_real_,
+          p_p_lag = NA_real_,
+          coef_inter = NA_real_,
+          p_inter = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "too_few_obs"
+        ))
+      }
+
+      m <- tryCatch(
+        feols(
+          dG ~ p_lag * near_election_12m | country^year,
+          data = d,
+          cluster = ~country
+        ),
+        error = function(e) NULL
+      )
+
+      if(is.null(m)){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef_p_lag = NA_real_,
+          p_p_lag = NA_real_,
+          coef_inter = NA_real_,
+          p_inter = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "failed"
+        ))
+      }
+
+      ct <- tryCatch(summary(m)$coeftable, error = function(e) NULL)
+
+      if(is.null(ct) || !("p_lag" %in% rownames(ct)) || !("p_lag:near_election_12m" %in% rownames(ct))){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef_p_lag = NA_real_,
+          p_p_lag = NA_real_,
+          coef_inter = NA_real_,
+          p_inter = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "no_coef"
+        ))
+      }
+
+      tibble(
+        variable = var,
+        lag = L,
+        coef_p_lag = ct["p_lag", "Estimate"],
+        p_p_lag = ct["p_lag", "Pr(>|t|)"],
+        coef_inter = ct["p_lag:near_election_12m", "Estimate"],
+        p_inter = ct["p_lag:near_election_12m", "Pr(>|t|)"],
+        n = nrow(d),
+        spec = spec_name,
+        status = "ok"
+      )
+    })
+  })
+}
+
+run_lags_diff_margin_interaction <- function(data_panel, vars, L_max = 12, spec_name = "margin") {
+  purrr::map_dfr(vars, function(var) {
+    purrr::map_dfr(1:L_max, function(L) {
+      d <- data_panel %>%
+        arrange(country, year_month) %>%
+        group_by(country) %>%
+        mutate(
+          dG = G_Trends - lag(G_Trends),
+          dN = .data[[var]] - lag(.data[[var]]),
+          p_lag = lag(dN, L)
+        ) %>%
+        ungroup() %>%
+        filter(
+          !is.na(dG),
+          !is.na(p_lag),
+          !is.na(last_election_margin_pp)
+        )
+
+      if(nrow(d) < 30){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef_p_lag = NA_real_,
+          p_p_lag = NA_real_,
+          coef_inter = NA_real_,
+          p_inter = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "too_few_obs"
+        ))
+      }
+
+      m <- tryCatch(
+        feols(
+          dG ~ p_lag * last_election_margin_pp | country^year,
+          data = d,
+          cluster = ~country
+        ),
+        error = function(e) NULL
+      )
+
+      if(is.null(m)){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef_p_lag = NA_real_,
+          p_p_lag = NA_real_,
+          coef_inter = NA_real_,
+          p_inter = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "failed"
+        ))
+      }
+
+      ct <- tryCatch(summary(m)$coeftable, error = function(e) NULL)
+
+      if(is.null(ct) || !("p_lag" %in% rownames(ct)) || !("p_lag:last_election_margin_pp" %in% rownames(ct))){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef_p_lag = NA_real_,
+          p_p_lag = NA_real_,
+          coef_inter = NA_real_,
+          p_inter = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "no_coef"
+        ))
+      }
+
+      tibble(
+        variable = var,
+        lag = L,
+        coef_p_lag = ct["p_lag", "Estimate"],
+        p_p_lag = ct["p_lag", "Pr(>|t|)"],
+        coef_inter = ct["p_lag:last_election_margin_pp", "Estimate"],
+        p_inter = ct["p_lag:last_election_margin_pp", "Pr(>|t|)"],
+        n = nrow(d),
+        spec = spec_name,
+        status = "ok"
+      )
+    })
+  })
+}
+
+run_same_sample_baseline_close <- function(data_panel, vars, L_max = 12, spec_name = "baseline_close_sample") {
+  purrr::map_dfr(vars, function(var) {
+    purrr::map_dfr(1:L_max, function(L) {
+      d <- data_panel %>%
+        arrange(country, year_month) %>%
+        group_by(country) %>%
+        mutate(
+          dG = G_Trends - lag(G_Trends),
+          dN = .data[[var]] - lag(.data[[var]]),
+          p_lag = lag(dN, L)
+        ) %>%
+        ungroup() %>%
+        filter(
+          !is.na(dG),
+          !is.na(p_lag),
+          !is.na(close_race_5pp)
+        )
+
+      m <- tryCatch(
+        feols(
+          dG ~ p_lag | country^year,
+          data = d,
+          cluster = ~country
+        ),
+        error = function(e) NULL
+      )
+
+      if(is.null(m)){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef = NA_real_,
+          p_value = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "failed"
+        ))
+      }
+
+      ct <- tryCatch(summary(m)$coeftable, error = function(e) NULL)
+
+      if(is.null(ct) || !("p_lag" %in% rownames(ct))){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef = NA_real_,
+          p_value = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "no_coef"
+        ))
+      }
+
+      tibble(
+        variable = var,
+        lag = L,
+        coef = ct["p_lag", "Estimate"],
+        p_value = ct["p_lag", "Pr(>|t|)"],
+        n = nrow(d),
+        spec = spec_name,
+        status = "ok"
+      )
+    })
+  })
+}
+
+run_same_sample_baseline_near <- function(data_panel, vars, L_max = 12, spec_name = "baseline_near_sample") {
+  purrr::map_dfr(vars, function(var) {
+    purrr::map_dfr(1:L_max, function(L) {
+      d <- data_panel %>%
+        arrange(country, year_month) %>%
+        group_by(country) %>%
+        mutate(
+          dG = G_Trends - lag(G_Trends),
+          dN = .data[[var]] - lag(.data[[var]]),
+          p_lag = lag(dN, L)
+        ) %>%
+        ungroup() %>%
+        filter(
+          !is.na(dG),
+          !is.na(p_lag),
+          !is.na(near_election_12m)
+        )
+
+      m <- tryCatch(
+        feols(
+          dG ~ p_lag | country^year,
+          data = d,
+          cluster = ~country
+        ),
+        error = function(e) NULL
+      )
+
+      if(is.null(m)){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef = NA_real_,
+          p_value = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "failed"
+        ))
+      }
+
+      ct <- tryCatch(summary(m)$coeftable, error = function(e) NULL)
+
+      if(is.null(ct) || !("p_lag" %in% rownames(ct))){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef = NA_real_,
+          p_value = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "no_coef"
+        ))
+      }
+
+      tibble(
+        variable = var,
+        lag = L,
+        coef = ct["p_lag", "Estimate"],
+        p_value = ct["p_lag", "Pr(>|t|)"],
+        n = nrow(d),
+        spec = spec_name,
+        status = "ok"
+      )
+    })
+  })
+}
+
+run_same_sample_baseline_margin <- function(data_panel, vars, L_max = 12, spec_name = "baseline_margin_sample") {
+  purrr::map_dfr(vars, function(var) {
+    purrr::map_dfr(1:L_max, function(L) {
+      d <- data_panel %>%
+        arrange(country, year_month) %>%
+        group_by(country) %>%
+        mutate(
+          dG = G_Trends - lag(G_Trends),
+          dN = .data[[var]] - lag(.data[[var]]),
+          p_lag = lag(dN, L)
+        ) %>%
+        ungroup() %>%
+        filter(
+          !is.na(dG),
+          !is.na(p_lag),
+          !is.na(last_election_margin_pp)
+        )
+
+      m <- tryCatch(
+        feols(
+          dG ~ p_lag | country^year,
+          data = d,
+          cluster = ~country
+        ),
+        error = function(e) NULL
+      )
+
+      if(is.null(m)){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef = NA_real_,
+          p_value = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "failed"
+        ))
+      }
+
+      ct <- tryCatch(summary(m)$coeftable, error = function(e) NULL)
+
+      if(is.null(ct) || !("p_lag" %in% rownames(ct))){
+        return(tibble(
+          variable = var,
+          lag = L,
+          coef = NA_real_,
+          p_value = NA_real_,
+          n = nrow(d),
+          spec = spec_name,
+          status = "no_coef"
+        ))
+      }
+
+      tibble(
+        variable = var,
+        lag = L,
+        coef = ct["p_lag", "Estimate"],
+        p_value = ct["p_lag", "Pr(>|t|)"],
+        n = nrow(d),
+        spec = spec_name,
+        status = "ok"
+      )
+    })
+  })
+}
+
+results_close_race_weighted_baseline <- run_lags_diff_close_race_interaction(
+  data_panel = df_weighted_owner_baseline_ec,
+  vars = weighted_narratives_baseline,
+  L_max = 12,
+  spec_name = "close_race_weighted_baseline"
+)
+
+results_near_election_weighted_baseline <- run_lags_diff_near_election_interaction(
+  data_panel = df_weighted_owner_baseline_ec,
+  vars = weighted_narratives_baseline,
+  L_max = 12,
+  spec_name = "near_election_weighted_baseline"
+)
+
+results_margin_weighted_baseline <- run_lags_diff_margin_interaction(
+  data_panel = df_weighted_owner_baseline_ec,
+  vars = weighted_narratives_baseline,
+  L_max = 12,
+  spec_name = "margin_weighted_baseline"
+)
+
+results_close_race_weighted_discounted <- run_lags_diff_close_race_interaction(
+  data_panel = df_weighted_owner_discounted_ec,
+  vars = weighted_narratives_discounted,
+  L_max = 12,
+  spec_name = "close_race_weighted_discounted"
+)
+
+results_near_election_weighted_discounted <- run_lags_diff_near_election_interaction(
+  data_panel = df_weighted_owner_discounted_ec,
+  vars = weighted_narratives_discounted,
+  L_max = 12,
+  spec_name = "near_election_weighted_discounted"
+)
+
+results_margin_weighted_discounted <- run_lags_diff_margin_interaction(
+  data_panel = df_weighted_owner_discounted_ec,
+  vars = weighted_narratives_discounted,
+  L_max = 12,
+  spec_name = "margin_weighted_discounted"
+)
+
+baseline_close_sample_weighted_baseline <- run_same_sample_baseline_close(
+  data_panel = df_weighted_owner_baseline_ec,
+  vars = weighted_narratives_baseline,
+  L_max = 12,
+  spec_name = "baseline_close_sample_weighted_baseline"
+)
+
+baseline_near_sample_weighted_baseline <- run_same_sample_baseline_near(
+  data_panel = df_weighted_owner_baseline_ec,
+  vars = weighted_narratives_baseline,
+  L_max = 12,
+  spec_name = "baseline_near_sample_weighted_baseline"
+)
+
+baseline_margin_sample_weighted_baseline <- run_same_sample_baseline_margin(
+  data_panel = df_weighted_owner_baseline_ec,
+  vars = weighted_narratives_baseline,
+  L_max = 12,
+  spec_name = "baseline_margin_sample_weighted_baseline"
+)
+
+baseline_close_sample_weighted_discounted <- run_same_sample_baseline_close(
+  data_panel = df_weighted_owner_discounted_ec,
+  vars = weighted_narratives_discounted,
+  L_max = 12,
+  spec_name = "baseline_close_sample_weighted_discounted"
+)
+
+baseline_near_sample_weighted_discounted <- run_same_sample_baseline_near(
+  data_panel = df_weighted_owner_discounted_ec,
+  vars = weighted_narratives_discounted,
+  L_max = 12,
+  spec_name = "baseline_near_sample_weighted_discounted"
+)
+
+baseline_margin_sample_weighted_discounted <- run_same_sample_baseline_margin(
+  data_panel = df_weighted_owner_discounted_ec,
+  vars = weighted_narratives_discounted,
+  L_max = 12,
+  spec_name = "baseline_margin_sample_weighted_discounted"
+)
+
+close_race_weighted_baseline_hits <- results_close_race_weighted_baseline %>%
+  filter(status == "ok", p_inter < 0.1) %>%
+  label_results() %>%
+  arrange(p_inter)
+
+near_election_weighted_baseline_hits <- results_near_election_weighted_baseline %>%
+  filter(status == "ok", p_inter < 0.1) %>%
+  label_results() %>%
+  arrange(p_inter)
+
+margin_weighted_baseline_hits <- results_margin_weighted_baseline %>%
+  filter(status == "ok", p_inter < 0.1) %>%
+  label_results() %>%
+  arrange(p_inter)
+
+close_race_weighted_discounted_hits <- results_close_race_weighted_discounted %>%
+  filter(status == "ok", p_inter < 0.1) %>%
+  label_results() %>%
+  arrange(p_inter)
+
+near_election_weighted_discounted_hits <- results_near_election_weighted_discounted %>%
+  filter(status == "ok", p_inter < 0.1) %>%
+  label_results() %>%
+  arrange(p_inter)
+
+margin_weighted_discounted_hits <- results_margin_weighted_discounted %>%
+  filter(status == "ok", p_inter < 0.1) %>%
+  label_results() %>%
+  arrange(p_inter)
+
+interaction_results_weighted_baseline <- bind_rows(
+  results_close_race_weighted_baseline,
+  results_near_election_weighted_baseline,
+  results_margin_weighted_baseline
+)
+
+interaction_results_weighted_discounted <- bind_rows(
+  results_close_race_weighted_discounted,
+  results_near_election_weighted_discounted,
+  results_margin_weighted_discounted
+)
+
+interaction_hits_weighted_baseline <- interaction_results_weighted_baseline %>%
+  filter(status == "ok", p_inter < 0.1) %>%
+  label_results() %>%
+  arrange(spec, p_inter)
+
+interaction_hits_weighted_discounted <- interaction_results_weighted_discounted %>%
+  filter(status == "ok", p_inter < 0.1) %>%
+  label_results() %>%
+  arrange(spec, p_inter)
+
+compare_close_race_weighted_baseline <- results_close_race_weighted_baseline %>%
+  filter(status == "ok") %>%
+  left_join(
+    baseline_close_sample_weighted_baseline %>%
+      filter(status == "ok") %>%
+      select(variable, lag, coef_base = coef, p_base = p_value),
+    by = c("variable", "lag")
+  ) %>%
+  mutate(
+    effect_non_close = coef_p_lag,
+    effect_close_race = coef_p_lag + coef_inter
+  )
+
+compare_near_election_weighted_baseline <- results_near_election_weighted_baseline %>%
+  filter(status == "ok") %>%
+  left_join(
+    baseline_near_sample_weighted_baseline %>%
+      filter(status == "ok") %>%
+      select(variable, lag, coef_base = coef, p_base = p_value),
+    by = c("variable", "lag")
+  ) %>%
+  mutate(
+    effect_non_election = coef_p_lag,
+    effect_near_election = coef_p_lag + coef_inter
+  )
+
+compare_margin_weighted_baseline <- results_margin_weighted_baseline %>%
+  filter(status == "ok") %>%
+  left_join(
+    baseline_margin_sample_weighted_baseline %>%
+      filter(status == "ok") %>%
+      select(variable, lag, coef_base = coef, p_base = p_value),
+    by = c("variable", "lag")
+  ) %>%
+  mutate(
+    effect_high_competition = coef_p_lag + coef_inter * 5,
+    effect_medium_competition = coef_p_lag + coef_inter * 10,
+    effect_low_competition = coef_p_lag + coef_inter * 20
+  )
+
+compare_close_race_weighted_discounted <- results_close_race_weighted_discounted %>%
+  filter(status == "ok") %>%
+  left_join(
+    baseline_close_sample_weighted_discounted %>%
+      filter(status == "ok") %>%
+      select(variable, lag, coef_base = coef, p_base = p_value),
+    by = c("variable", "lag")
+  ) %>%
+  mutate(
+    effect_non_close = coef_p_lag,
+    effect_close_race = coef_p_lag + coef_inter
+  )
+
+compare_near_election_weighted_discounted <- results_near_election_weighted_discounted %>%
+  filter(status == "ok") %>%
+  left_join(
+    baseline_near_sample_weighted_discounted %>%
+      filter(status == "ok") %>%
+      select(variable, lag, coef_base = coef, p_base = p_value),
+    by = c("variable", "lag")
+  ) %>%
+  mutate(
+    effect_non_election = coef_p_lag,
+    effect_near_election = coef_p_lag + coef_inter
+  )
+
+compare_margin_weighted_discounted <- results_margin_weighted_discounted %>%
+  filter(status == "ok") %>%
+  left_join(
+    baseline_margin_sample_weighted_discounted %>%
+      filter(status == "ok") %>%
+      select(variable, lag, coef_base = coef, p_base = p_value),
+    by = c("variable", "lag")
+  ) %>%
+  mutate(
+    effect_high_competition = coef_p_lag + coef_inter * 5,
+    effect_medium_competition = coef_p_lag + coef_inter * 10,
+    effect_low_competition = coef_p_lag + coef_inter * 20
+  )
+
+df_weighted_owner_baseline_ec %>%
+  summarise(
+    n_obs = n(),
+    n_close_race_nonmissing = sum(!is.na(close_race_5pp)),
+    n_margin_nonmissing = sum(!is.na(last_election_margin_pp)),
+    n_near_election_nonmissing = sum(!is.na(near_election_12m))
+  )
+
+df_weighted_owner_baseline_ec %>%
+  group_by(country) %>%
+  summarise(
+    n_obs = n(),
+    n_close_race_nonmissing = sum(!is.na(close_race_5pp)),
+    n_margin_nonmissing = sum(!is.na(last_election_margin_pp)),
+    .groups = "drop"
+  ) %>%
+  arrange(country)
+
+df_weighted_owner_discounted_ec %>%
+  summarise(
+    n_obs = n(),
+    n_close_race_nonmissing = sum(!is.na(close_race_5pp)),
+    n_margin_nonmissing = sum(!is.na(last_election_margin_pp)),
+    n_near_election_nonmissing = sum(!is.na(near_election_12m))
+  )
+
+df_weighted_owner_discounted_ec %>%
+  group_by(country) %>%
+  summarise(
+    n_obs = n(),
+    n_close_race_nonmissing = sum(!is.na(close_race_5pp)),
+    n_margin_nonmissing = sum(!is.na(last_election_margin_pp)),
+    .groups = "drop"
+  ) %>%
+  arrange(country)
+```
