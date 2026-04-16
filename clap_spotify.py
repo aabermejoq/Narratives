@@ -1,21 +1,7 @@
 """
-Jarvis Audio-to-Spotify
-Controla Spotify con voz, aplausos y silbidos.
-
-Comandos de voz (di "Jarvis, ..."):
-  buenos días        → "Buenos días Aaron"
-  adelante/siguiente → siguiente canción
-  atrás/anterior     → canción anterior
-  pausa / play       → play / pause
-  sube el volumen    → volumen +10%
-  baja el volumen    → volumen -10%
-
-Gestos:
-  2 aplausos → play/pause
-  3 aplausos → siguiente
-  4 aplausos → anterior
-  Silbido corto (<0.6s) → volumen -10%
-  Silbido largo (≥0.6s) → volumen +10%
+Jarvis Cumbia
+  - 2 aplausos  → reproduce una cumbia random en Spotify
+  - "Buenos días Jarvis" → "Buenos días Aaron" + frase motivacional
 
 Setup:
   export SPOTIFY_CLIENT_ID=...
@@ -27,6 +13,7 @@ Setup:
 import os
 import sys
 import time
+import random
 import queue
 import logging
 import threading
@@ -37,35 +24,29 @@ import pyttsx3
 import speech_recognition as sr
 from spotipy.oauth2 import SpotifyOAuth
 
-# ── Configuración Spotify ─────────────────────────────────────────────────────
+# ── Configuración ─────────────────────────────────────────────────────────────
 
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "TU_CLIENT_ID_AQUI")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "TU_CLIENT_SECRET_AQUI")
 SPOTIFY_REDIRECT_URI  = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
-SPOTIFY_TRACK_URI     = os.getenv("SPOTIFY_TRACK_URI", "")
-JARVIS_NAME           = os.getenv("JARVIS_NAME", "Aaron")
-
-# ── Parámetros de audio ───────────────────────────────────────────────────────
 
 SAMPLE_RATE    = 44100
 CHUNK_DURATION = 0.04
 
-# Aplausos
 CLAP_MIN_RMS  = 0.06
 CLAP_ONSET    = 6.0
 CLAP_COOLDOWN = 0.4
 CLAP_WINDOW   = 2.0
 
-# Silbidos (FFT)
-WHISTLE_FREQ_LOW  = 1000
-WHISTLE_FREQ_HIGH = 2500
-WHISTLE_MIN_RMS   = 0.02
-WHISTLE_DOMINANCE = 8.0
-WHISTLE_MIN_DUR   = 0.3    # duración mínima para contar como silbido real
-WHISTLE_SHORT_MAX = 0.6    # < 0.6s = bajar, >= 0.6s = subir
-VOLUME_STEP       = 10
+PLAY_COOLDOWN = 10.0   # segundos bloqueados tras reproducir
 
-ACTION_COOLDOWN = 30.0
+FRASES = [
+    "Hoy es un gran día para comerse el mundo.",
+    "Cada mañana es una nueva oportunidad.",
+    "Tú puedes con todo lo que venga hoy.",
+    "Un paso a la vez, Aaron. Tú lo tienes.",
+    "Hoy vas a romperla.",
+]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -79,10 +60,7 @@ log = logging.getLogger("jarvis")
 # ── TTS ───────────────────────────────────────────────────────────────────────
 
 _tts_queue: queue.Queue = queue.Queue()
-is_speaking = threading.Event()   # True mientras Jarvis habla → mic ignorado
-
-# Cola compartida de audio para reconocimiento de voz
-_voice_audio_queue: queue.Queue = queue.Queue(maxsize=500)
+is_speaking = threading.Event()
 
 def _tts_worker() -> None:
     engine = pyttsx3.init()
@@ -98,148 +76,86 @@ def _tts_worker() -> None:
         is_speaking.set()
         engine.say(text)
         engine.runAndWait()
-        time.sleep(0.5)   # margen extra para que el eco se disipe
+        time.sleep(0.5)
         is_speaking.clear()
 
 def speak(text: str) -> None:
     log.info("🔊  %s", text)
     _tts_queue.put(text)
 
-# ── Acciones Spotify ──────────────────────────────────────────────────────────
+# ── Spotify ───────────────────────────────────────────────────────────────────
 
-def get_active_device(sp):
-    devices = sp.devices()["devices"]
-    return next((d for d in devices if d["is_active"]), None) or next(iter(devices), None)
-
-
-def action_play_pause(sp) -> None:
-    state = sp.current_playback()
-    if state and state["is_playing"]:
-        sp.pause_playback()
-        speak("Pausado")
-    else:
-        if SPOTIFY_TRACK_URI:
-            device = get_active_device(sp)
-            if device:
-                sp.start_playback(device_id=device["id"], uris=[SPOTIFY_TRACK_URI])
-        else:
-            sp.start_playback()
-        speak("Reproduciendo")
-
-
-def action_next(sp) -> None:
-    sp.next_track()
-    speak("Siguiente canción")
-
-
-def action_previous(sp) -> None:
-    sp.previous_track()
-    speak("Canción anterior")
-
-
-def action_volume(sp, direction: str) -> None:
-    device = get_active_device(sp)
-    if device is None:
+def play_random_cumbia(sp: spotipy.Spotify) -> None:
+    results = sp.search(q="cumbia", type="track", limit=50, market="MX")
+    tracks = results["tracks"]["items"]
+    if not tracks:
+        log.warning("No se encontraron cumbias.")
         return
-    current = device.get("volume_percent", 50) or 50
-    new_vol = max(0, min(100, current + (VOLUME_STEP if direction == "up" else -VOLUME_STEP)))
-    sp.volume(new_vol, device_id=device["id"])
-    speak(f"Volumen al {new_vol} por ciento")
+    track = random.choice(tracks)
+    devices = sp.devices()["devices"]
+    device = next((d for d in devices if d["is_active"]), None) or next(iter(devices), None)
+    if device is None:
+        log.warning("Abre Spotify en tu Mac primero.")
+        return
+    sp.start_playback(device_id=device["id"], uris=[track["uri"]])
+    log.info("▶  %s — %s", track["name"], track["artists"][0]["name"])
 
+# ── Detección de aplausos ─────────────────────────────────────────────────────
 
-# ── Detección de aplausos y silbidos ──────────────────────────────────────────
-
-class AudioDetector:
+class ClapDetector:
     def __init__(self, action_queue: queue.Queue) -> None:
         self._q = action_queue
         self._prev_rms: float = 0.0
         self._last_clap_time: float = 0.0
         self._clap_times: list[float] = []
-        self._was_whistling: bool = False
-        self._whistle_start: float = 0.0
-        self._lock = threading.Lock()
         self._blocked_until: float = 0.0
-
-    def _is_blocked(self, now: float) -> bool:
-        return now < self._blocked_until
+        self._lock = threading.Lock()
 
     def block(self) -> None:
         with self._lock:
-            self._blocked_until = time.monotonic() + ACTION_COOLDOWN
+            self._blocked_until = time.monotonic() + PLAY_COOLDOWN
             self._clap_times.clear()
-            self._prev_rms = 0.0
-            self._was_whistling = False
-
-    def _check_clap(self, rms: float, now: float) -> None:
-        prev = self._prev_rms
-        is_clap = (
-            rms >= CLAP_MIN_RMS
-            and prev > 0
-            and (rms / prev) >= CLAP_ONSET
-            and (now - self._last_clap_time) >= CLAP_COOLDOWN
-        )
-        if is_clap:
-            self._last_clap_time = now
-            self._clap_times.append(now)
-            log.debug("Aplauso #%d", len(self._clap_times))
-
-        self._clap_times = [t for t in self._clap_times if now - t <= CLAP_WINDOW]
-        count = len(self._clap_times)
-        silence = (now - self._last_clap_time) > CLAP_COOLDOWN * 2
-
-        if count >= 4:
-            self._clap_times.clear()
-            self._q.put("previous")
-        elif count == 3 and silence:
-            self._clap_times.clear()
-            self._q.put("next")
-        elif count == 2 and silence:
-            self._clap_times.clear()
-            self._q.put("play_pause")
-
-    def _check_whistle(self, chunk: np.ndarray, rms: float, now: float) -> None:
-        fft_mag = np.abs(np.fft.rfft(chunk))
-        freqs   = np.fft.rfftfreq(len(chunk), d=1.0 / SAMPLE_RATE)
-        mask    = (freqs >= WHISTLE_FREQ_LOW) & (freqs <= WHISTLE_FREQ_HIGH)
-        if not mask.any():
-            return
-        peak     = float(fft_mag[mask].max())
-        mean_all = float(fft_mag.mean()) + 1e-9
-        is_whistle = rms >= WHISTLE_MIN_RMS and (peak / mean_all) >= WHISTLE_DOMINANCE
-
-        if is_whistle:
-            if not self._was_whistling:
-                self._was_whistling = True
-                self._whistle_start = now
-        else:
-            if self._was_whistling:
-                duration = now - self._whistle_start
-                if duration >= WHISTLE_MIN_DUR:
-                    self._q.put("volume_up" if duration >= WHISTLE_SHORT_MAX else "volume_down")
-            self._was_whistling = False
 
     def process_chunk(self, chunk: np.ndarray) -> None:
         rms = float(np.sqrt(np.mean(chunk ** 2)))
         now = time.monotonic()
         with self._lock:
-            if not self._is_blocked(now):
-                self._check_clap(rms, now)
-                self._check_whistle(chunk, rms, now)
+            if now < self._blocked_until:
+                self._prev_rms = rms
+                return
+
+            prev = self._prev_rms
             self._prev_rms = rms
 
+            is_clap = (
+                rms >= CLAP_MIN_RMS
+                and prev > 0
+                and (rms / prev) >= CLAP_ONSET
+                and (now - self._last_clap_time) >= CLAP_COOLDOWN
+            )
+            if is_clap:
+                self._last_clap_time = now
+                self._clap_times.append(now)
+                log.debug("Aplauso #%d", len(self._clap_times))
+
+            self._clap_times = [t for t in self._clap_times if now - t <= CLAP_WINDOW]
+
+            if (len(self._clap_times) >= 2
+                    and (now - self._last_clap_time) > CLAP_COOLDOWN * 2):
+                self._clap_times.clear()
+                self._q.put("cumbia")
 
 # ── Reconocimiento de voz ─────────────────────────────────────────────────────
 
-def voice_listener(action_queue: queue.Queue, stop_event: threading.Event) -> None:
-    """Lee del buffer compartido del stream principal — sin abrir segundo stream."""
-    recognizer = sr.Recognizer()
-    chunks_needed = int(4.0 / CHUNK_DURATION)   # 4 segundos de audio
+_voice_audio_queue: queue.Queue = queue.Queue(maxsize=500)
 
-    log.info("Micrófono de voz listo.")
+def voice_listener(action_queue: queue.Queue, stop_event: threading.Event) -> None:
+    recognizer = sr.Recognizer()
+    chunks_needed = int(4.0 / CHUNK_DURATION)
+    log.info("Voz lista.")
 
     while not stop_event.is_set():
         if is_speaking.is_set():
-            # vacía el buffer mientras Jarvis habla
             while not _voice_audio_queue.empty():
                 try:
                     _voice_audio_queue.get_nowait()
@@ -248,12 +164,10 @@ def voice_listener(action_queue: queue.Queue, stop_event: threading.Event) -> No
             time.sleep(0.1)
             continue
 
-        # acumula chunks hasta tener 4 segundos
         collected: list[np.ndarray] = []
         while len(collected) < chunks_needed and not stop_event.is_set():
             try:
-                chunk = _voice_audio_queue.get(timeout=1)
-                collected.append(chunk)
+                collected.append(_voice_audio_queue.get(timeout=1))
             except queue.Empty:
                 continue
 
@@ -262,33 +176,18 @@ def voice_listener(action_queue: queue.Queue, stop_event: threading.Event) -> No
 
         try:
             pcm = (np.concatenate(collected) * 32767).astype(np.int16)
-            audio_data = sr.AudioData(pcm.tobytes(), SAMPLE_RATE, 2)
-            text = recognizer.recognize_google(audio_data, language="es-ES").lower()
+            text = recognizer.recognize_google(
+                sr.AudioData(pcm.tobytes(), SAMPLE_RATE, 2), language="es-ES"
+            ).lower()
             log.info("Voz: '%s'", text)
 
-            if "jarvis" not in text:
-                continue
-
-            if any(w in text for w in ["buenos días", "buenos dias"]):
+            if "jarvis" in text and any(w in text for w in ["buenos días", "buenos dias"]):
                 action_queue.put("greet")
-            elif any(w in text for w in ["adelante", "siguiente"]):
-                action_queue.put("next")
-            elif any(w in text for w in ["atrás", "atras", "anterior"]):
-                action_queue.put("previous")
-            elif any(w in text for w in ["pausa", "pausar", "para"]):
-                action_queue.put("pause")
-            elif any(w in text for w in ["play", "reproduce", "continúa", "continua"]):
-                action_queue.put("resume")
-            elif "sube" in text and "volumen" in text:
-                action_queue.put("volume_up")
-            elif "baja" in text and "volumen" in text:
-                action_queue.put("volume_down")
 
         except sr.UnknownValueError:
             pass
         except Exception as exc:
             log.error("Error voz: %s", exc)
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -301,14 +200,13 @@ def main() -> None:
         client_id=SPOTIFY_CLIENT_ID,
         client_secret=SPOTIFY_CLIENT_SECRET,
         redirect_uri=SPOTIFY_REDIRECT_URI,
-        scope="user-modify-playback-state user-read-playback-state user-read-currently-playing",
+        scope="user-modify-playback-state user-read-playback-state",
         open_browser=True,
     ))
     log.info("Conexión exitosa.")
 
     action_queue: queue.Queue = queue.Queue()
-    detector = AudioDetector(action_queue)
-    chunk_size = int(SAMPLE_RATE * CHUNK_DURATION)
+    detector = ClapDetector(action_queue)
     stop_event = threading.Event()
 
     threading.Thread(target=_tts_worker, daemon=True).start()
@@ -317,71 +215,54 @@ def main() -> None:
     _start_time = time.monotonic()
 
     def audio_callback(indata, frames, time_info, status):
-        if status:
-            log.warning("Audio: %s", status)
         mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
-        # alimenta el detector de aplausos/silbidos
         if time.monotonic() - _start_time >= 3.0:
             detector.process_chunk(mono)
-        # alimenta el reconocedor de voz (sin bloquear si la cola está llena)
         if not is_speaking.is_set():
             try:
                 _voice_audio_queue.put_nowait(mono.copy())
             except queue.Full:
                 pass
 
-    log.info("Jarvis listo. Di 'Jarvis, buenos días' para empezar.")
-
-    handlers = {
-        "play_pause":  lambda: action_play_pause(sp),
-        "next":        lambda: action_next(sp),
-        "previous":    lambda: action_previous(sp),
-        "pause":       lambda: (sp.pause_playback(), speak("Pausado")),
-        "resume":      lambda: (sp.start_playback(), speak("Reproduciendo")),
-        "volume_up":   lambda: action_volume(sp, "up"),
-        "volume_down": lambda: action_volume(sp, "down"),
-        "greet":       lambda: speak(f"Buenos días {JARVIS_NAME}"),
-    }
+    log.info("Listo. Aplaude 2 veces o di 'Buenos días Jarvis'.")
 
     try:
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=chunk_size,
-            callback=audio_callback,
-        ):
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                            blocksize=int(SAMPLE_RATE * CHUNK_DURATION),
+                            callback=audio_callback):
             while True:
                 try:
                     action = action_queue.get(timeout=1)
                 except queue.Empty:
                     continue
-                # vacía cola para evitar acumulación
+
                 while not action_queue.empty():
                     try:
                         action_queue.get_nowait()
                     except queue.Empty:
                         break
 
-                log.info("Acción: %s", action)
-                try:
-                    handlers[action]()
-                except Exception as exc:
-                    log.error("Error en '%s': %s", action, exc)
-
-                # espera a que termine el TTS antes de volver a escuchar
-                while is_speaking.is_set():
-                    time.sleep(0.1)
-
-                if action == "greet":
-                    time.sleep(1)  # pequeña pausa antes de escuchar de nuevo
-                else:
+                if action == "cumbia":
+                    log.info("¡Aplauso! Buscando cumbia…")
+                    try:
+                        play_random_cumbia(sp)
+                    except Exception as exc:
+                        log.error("%s", exc)
                     detector.block()
-                    time.sleep(ACTION_COOLDOWN)
+                    while is_speaking.is_set():
+                        time.sleep(0.1)
+                    time.sleep(PLAY_COOLDOWN)
+
+                elif action == "greet":
+                    frase = random.choice(FRASES)
+                    speak(f"Buenos días Aaron. {frase}")
+                    while is_speaking.is_set():
+                        time.sleep(0.1)
+
     except KeyboardInterrupt:
         stop_event.set()
         _tts_queue.put(None)
-        log.info("Detenido.")
+        log.info("Hasta luego.")
     except sd.PortAudioError as exc:
         sys.exit(f"Error de micrófono: {exc}")
 
