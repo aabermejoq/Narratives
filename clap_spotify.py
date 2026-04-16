@@ -86,7 +86,7 @@ def speak(text: str) -> None:
 # ── Spotify ───────────────────────────────────────────────────────────────────
 
 def play_random_cumbia(sp: spotipy.Spotify) -> None:
-    results = sp.search(q="cumbia", type="track", limit=50, market="MX")
+    results = sp.search(q="cumbia", type="track", limit=20, market="MX")
     tracks = results["tracks"]["items"]
     if not tracks:
         log.warning("No se encontraron cumbias.")
