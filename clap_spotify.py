@@ -81,6 +81,9 @@ log = logging.getLogger("jarvis")
 _tts_queue: queue.Queue = queue.Queue()
 is_speaking = threading.Event()   # True mientras Jarvis habla → mic ignorado
 
+# Cola compartida de audio para reconocimiento de voz
+_voice_audio_queue: queue.Queue = queue.Queue(maxsize=500)
+
 def _tts_worker() -> None:
     engine = pyttsx3.init()
     for voice in engine.getProperty("voices"):
@@ -228,26 +231,38 @@ class AudioDetector:
 # ── Reconocimiento de voz ─────────────────────────────────────────────────────
 
 def voice_listener(action_queue: queue.Queue, stop_event: threading.Event) -> None:
-    """Graba 4s con sounddevice (sin PyAudio) y manda a Google STT."""
+    """Lee del buffer compartido del stream principal — sin abrir segundo stream."""
     recognizer = sr.Recognizer()
-    record_secs = 4
-    frames = int(SAMPLE_RATE * record_secs)
+    chunks_needed = int(4.0 / CHUNK_DURATION)   # 4 segundos de audio
 
     log.info("Micrófono de voz listo.")
 
     while not stop_event.is_set():
         if is_speaking.is_set():
+            # vacía el buffer mientras Jarvis habla
+            while not _voice_audio_queue.empty():
+                try:
+                    _voice_audio_queue.get_nowait()
+                except queue.Empty:
+                    break
             time.sleep(0.1)
             continue
-        try:
-            # Graba usando sounddevice — sin abrir un segundo driver de audio
-            recording = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1,
-                               dtype="int16", blocking=True)
 
-            if is_speaking.is_set():
+        # acumula chunks hasta tener 4 segundos
+        collected: list[np.ndarray] = []
+        while len(collected) < chunks_needed and not stop_event.is_set():
+            try:
+                chunk = _voice_audio_queue.get(timeout=1)
+                collected.append(chunk)
+            except queue.Empty:
                 continue
 
-            audio_data = sr.AudioData(recording.tobytes(), SAMPLE_RATE, 2)
+        if is_speaking.is_set() or not collected:
+            continue
+
+        try:
+            pcm = (np.concatenate(collected) * 32767).astype(np.int16)
+            audio_data = sr.AudioData(pcm.tobytes(), SAMPLE_RATE, 2)
             text = recognizer.recognize_google(audio_data, language="es-ES").lower()
             log.info("Voz: '%s'", text)
 
@@ -302,12 +317,18 @@ def main() -> None:
     _start_time = time.monotonic()
 
     def audio_callback(indata, frames, time_info, status):
-        if time.monotonic() - _start_time < 3.0:   # ignora los primeros 3s
-            return
         if status:
             log.warning("Audio: %s", status)
         mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
-        detector.process_chunk(mono)
+        # alimenta el detector de aplausos/silbidos
+        if time.monotonic() - _start_time >= 3.0:
+            detector.process_chunk(mono)
+        # alimenta el reconocedor de voz (sin bloquear si la cola está llena)
+        if not is_speaking.is_set():
+            try:
+                _voice_audio_queue.put_nowait(mono.copy())
+            except queue.Full:
+                pass
 
     log.info("Jarvis listo. Di 'Jarvis, buenos días' para empezar.")
 
