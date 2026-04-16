@@ -28,17 +28,17 @@ SPOTIFY_REDIRECT_URI  = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888
 # URI de la canción → botón derecho en Spotify → Compartir → Copiar URI del tema
 SPOTIFY_TRACK_URI = os.getenv(
     "SPOTIFY_TRACK_URI",
-    "spotify:track:4uLU6hMCjMI75M1A2tKUQC"   # Never Gonna Give You Up - Rick Astley (ejemplo)
+    "spotify:track:4uLU6hMCjMI75M1A2tKUQC"
 )
 
 # Detección de aplausos
 SAMPLE_RATE       = 44100   # Hz
 CHUNK_DURATION    = 0.05    # segundos por bloque de audio
-CLAP_THRESHOLD    = 0.05    # amplitud RMS mínima (0.0–1.0); bájala si tu micro es poco sensible
-CLAP_COOLDOWN     = 0.3     # segundos de espera entre aplausos para evitar dobles disparos
-CLAPS_REQUIRED    = 2       # número de aplausos consecutivos para disparar Spotify
-CLAP_WINDOW       = 1.5     # ventana de tiempo (s) en la que deben ocurrir los aplausos
-PLAY_COOLDOWN     = 5.0     # segundos de bloqueo tras reproducir para evitar disparos múltiples
+CLAP_THRESHOLD    = 0.05    # amplitud RMS mínima (0.0–1.0)
+CLAP_COOLDOWN     = 0.3     # segundos mínimos entre aplausos individuales
+CLAPS_REQUIRED    = 2       # aplausos necesarios para disparar
+CLAP_WINDOW       = 1.5     # ventana de tiempo en segundos
+PLAY_COOLDOWN     = 8.0     # segundos bloqueados tras reproducir
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -65,20 +65,14 @@ def build_spotify_client() -> spotipy.Spotify:
 
 def play_track(sp: spotipy.Spotify, track_uri: str) -> None:
     devices = sp.devices()
-    active = next(
-        (d for d in devices["devices"] if d["is_active"]),
-        None,
-    )
+    active = next((d for d in devices["devices"] if d["is_active"]), None)
     if active is None:
         active = next(iter(devices["devices"]), None)
-
     if active is None:
-        log.warning("No se encontró ningún dispositivo Spotify activo. Abre Spotify en tu PC/móvil.")
+        log.warning("No se encontró ningún dispositivo Spotify activo.")
         return
-
-    device_id = active["id"]
-    sp.start_playback(device_id=device_id, uris=[track_uri])
-    log.info("▶  Reproduciendo %s en '%s'", track_uri, active["name"])
+    sp.start_playback(device_id=active["id"], uris=[track_uri])
+    log.info("▶  Reproduciendo en '%s'", active["name"])
 
 
 # ── Detección de aplausos ─────────────────────────────────────────────────────
@@ -86,12 +80,11 @@ def play_track(sp: spotipy.Spotify, track_uri: str) -> None:
 class ClapDetector:
     def __init__(self) -> None:
         self._last_clap_time: float = 0.0
-        self._last_play_time: float = 0.0
         self._clap_times: list[float] = []
         self._lock = threading.Lock()
+        self._triggered = threading.Event()  # señal al hilo principal
 
-    def process_chunk(self, chunk: np.ndarray) -> bool:
-        """Devuelve True cuando se detecta la secuencia de aplausos requerida."""
+    def process_chunk(self, chunk: np.ndarray) -> None:
         rms = float(np.sqrt(np.mean(chunk ** 2)))
         now = time.monotonic()
 
@@ -99,23 +92,23 @@ class ClapDetector:
             if rms >= CLAP_THRESHOLD and (now - self._last_clap_time) >= CLAP_COOLDOWN:
                 self._last_clap_time = now
                 self._clap_times.append(now)
-                log.debug("Aplauso detectado (RMS=%.4f)", rms)
+                log.debug("Aplauso (RMS=%.4f) total=%d", rms, len(self._clap_times))
 
             self._clap_times = [t for t in self._clap_times if now - t <= CLAP_WINDOW]
 
-            if len(self._clap_times) >= CLAPS_REQUIRED:
+            if len(self._clap_times) >= CLAPS_REQUIRED and not self._triggered.is_set():
                 self._clap_times.clear()
-                if (now - self._last_play_time) >= PLAY_COOLDOWN:
-                    self._last_play_time = now
-                    return True
+                self._triggered.set()
 
-        return False
+    def wait_for_clap(self) -> None:
+        """Bloquea hasta detectar la secuencia de aplausos."""
+        self._triggered.wait()
+        self._triggered.clear()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # Validación básica de credenciales
     if "TU_CLIENT_ID" in SPOTIFY_CLIENT_ID:
         sys.exit(
             "ERROR: Falta configurar SPOTIFY_CLIENT_ID.\n"
@@ -129,22 +122,17 @@ def main() -> None:
     detector = ClapDetector()
     chunk_size = int(SAMPLE_RATE * CHUNK_DURATION)
 
-    log.info(
-        "Escuchando… aplaudE %d vez/veces en %.1fs para reproducir la canción. (Ctrl+C para salir)",
-        CLAPS_REQUIRED,
-        CLAP_WINDOW,
-    )
-
-    def audio_callback(indata: np.ndarray, frames: int, time_info, status) -> None:  # noqa: ARG001
+    def audio_callback(indata: np.ndarray, frames: int, time_info, status) -> None:
         if status:
             log.warning("Audio status: %s", status)
         mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
-        if detector.process_chunk(mono):
-            log.info("¡Aplauso detectado! Lanzando Spotify…")
-            try:
-                play_track(sp, SPOTIFY_TRACK_URI)
-            except Exception as exc:
-                log.error("Error al reproducir: %s", exc)
+        detector.process_chunk(mono)
+
+    log.info(
+        "Escuchando… aplaude %d veces en %.1fs para reproducir. (Ctrl+C para salir)",
+        CLAPS_REQUIRED,
+        CLAP_WINDOW,
+    )
 
     try:
         with sd.InputStream(
@@ -155,7 +143,15 @@ def main() -> None:
             callback=audio_callback,
         ):
             while True:
-                time.sleep(0.1)
+                detector.wait_for_clap()
+                log.info("¡Aplauso detectado! Lanzando Spotify…")
+                try:
+                    play_track(sp, SPOTIFY_TRACK_URI)
+                except Exception as exc:
+                    log.error("Error al reproducir: %s", exc)
+                # bloquea detección durante PLAY_COOLDOWN segundos
+                log.info("Esperando %.0fs antes de escuchar de nuevo…", PLAY_COOLDOWN)
+                time.sleep(PLAY_COOLDOWN)
     except KeyboardInterrupt:
         log.info("Detenido por el usuario.")
     except sd.PortAudioError as exc:
