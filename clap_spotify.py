@@ -33,12 +33,12 @@ SPOTIFY_TRACK_URI = os.getenv(
 # Detección — ajusta ONSET_RATIO si hace falta
 SAMPLE_RATE    = 44100
 CHUNK_DURATION = 0.04    # segundos por bloque
-MIN_RMS        = 0.03    # energía mínima absoluta (filtra silencio)
-ONSET_RATIO    = 4.0     # cuántas veces más alto que el chunk anterior = aplauso
+MIN_RMS        = 0.10    # energía mínima — aplaudir cerca del micro sube esto fácil
+ONSET_RATIO    = 10.0    # ratio de subida súbita — música no llega a esto
 CLAP_COOLDOWN  = 0.4     # segundos entre aplausos individuales
 CLAPS_REQUIRED = 2       # aplausos para disparar
-CLAP_WINDOW    = 2.0     # ventana en segundos
-PLAY_COOLDOWN  = 8.0     # segundos bloqueados tras reproducir
+CLAP_WINDOW    = 1.5     # ventana en segundos
+PLAY_COOLDOWN  = 30.0    # segundos bloqueados tras reproducir
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
