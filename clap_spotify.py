@@ -105,6 +105,13 @@ class ClapDetector:
         self._triggered.wait()
         self._triggered.clear()
 
+    def reset(self) -> None:
+        """Limpia todo el estado acumulado durante el cooldown."""
+        with self._lock:
+            self._clap_times.clear()
+            self._last_clap_time = time.monotonic()
+        self._triggered.clear()
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -152,6 +159,7 @@ def main() -> None:
                 # bloquea detección durante PLAY_COOLDOWN segundos
                 log.info("Esperando %.0fs antes de escuchar de nuevo…", PLAY_COOLDOWN)
                 time.sleep(PLAY_COOLDOWN)
+                detector.reset()
     except KeyboardInterrupt:
         log.info("Detenido por el usuario.")
     except sd.PortAudioError as exc:
