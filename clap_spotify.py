@@ -33,10 +33,11 @@ SPOTIFY_TRACK_URI = os.getenv(
 # Detección de aplausos
 SAMPLE_RATE       = 44100   # Hz
 CHUNK_DURATION    = 0.05    # segundos por bloque de audio
-CLAP_THRESHOLD    = 0.15    # amplitud RMS mínima (0.0–1.0); bájala si tu micro es poco sensible
-CLAP_COOLDOWN     = 1.5     # segundos de espera entre aplausos para evitar dobles disparos
+CLAP_THRESHOLD    = 0.05    # amplitud RMS mínima (0.0–1.0); bájala si tu micro es poco sensible
+CLAP_COOLDOWN     = 0.3     # segundos de espera entre aplausos para evitar dobles disparos
 CLAPS_REQUIRED    = 2       # número de aplausos consecutivos para disparar Spotify
-CLAP_WINDOW       = 2.0     # ventana de tiempo (s) en la que deben ocurrir los aplausos
+CLAP_WINDOW       = 1.5     # ventana de tiempo (s) en la que deben ocurrir los aplausos
+PLAY_COOLDOWN     = 5.0     # segundos de bloqueo tras reproducir para evitar disparos múltiples
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -84,6 +85,7 @@ def play_track(sp: spotipy.Spotify, track_uri: str) -> None:
 class ClapDetector:
     def __init__(self) -> None:
         self._last_clap_time: float = 0.0
+        self._last_play_time: float = 0.0
         self._clap_times: list[float] = []
 
     def process_chunk(self, chunk: np.ndarray) -> bool:
@@ -102,7 +104,9 @@ class ClapDetector:
 
         if len(self._clap_times) >= CLAPS_REQUIRED:
             self._clap_times.clear()
-            return True
+            if (now - self._last_play_time) >= PLAY_COOLDOWN:
+                self._last_play_time = now
+                return True
 
         return False
 
