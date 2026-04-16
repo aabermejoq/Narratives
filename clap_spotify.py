@@ -57,11 +57,12 @@ CLAP_COOLDOWN = 0.4
 CLAP_WINDOW   = 2.0
 
 # Silbidos (FFT)
-WHISTLE_FREQ_LOW  = 800
-WHISTLE_FREQ_HIGH = 3000
-WHISTLE_MIN_RMS   = 0.01
-WHISTLE_DOMINANCE = 6.0
-WHISTLE_SHORT_MAX = 0.6
+WHISTLE_FREQ_LOW  = 1000
+WHISTLE_FREQ_HIGH = 2500
+WHISTLE_MIN_RMS   = 0.05
+WHISTLE_DOMINANCE = 15.0
+WHISTLE_MIN_DUR   = 0.4    # duración mínima para contar como silbido real
+WHISTLE_SHORT_MAX = 0.9
 VOLUME_STEP       = 10
 
 ACTION_COOLDOWN = 30.0
@@ -210,7 +211,7 @@ class AudioDetector:
         else:
             if self._was_whistling:
                 duration = now - self._whistle_start
-                if duration >= 0.15:
+                if duration >= WHISTLE_MIN_DUR:
                     self._q.put("volume_up" if duration >= WHISTLE_SHORT_MAX else "volume_down")
             self._was_whistling = False
 
@@ -299,14 +300,16 @@ def main() -> None:
     threading.Thread(target=_tts_worker, daemon=True).start()
     threading.Thread(target=voice_listener, args=(action_queue, stop_event), daemon=True).start()
 
+    _start_time = time.monotonic()
+
     def audio_callback(indata, frames, time_info, status):
+        if time.monotonic() - _start_time < 3.0:   # ignora los primeros 3s
+            return
         if status:
             log.warning("Audio: %s", status)
         mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
         detector.process_chunk(mono)
 
-    # pausa de arranque para que el micrófono se estabilice
-    time.sleep(2)
     log.info("Jarvis listo. Di 'Jarvis, buenos días' para empezar.")
 
     handlers = {
