@@ -51,8 +51,8 @@ SAMPLE_RATE    = 44100
 CHUNK_DURATION = 0.04
 
 # Aplausos
-CLAP_MIN_RMS  = 0.10
-CLAP_ONSET    = 10.0
+CLAP_MIN_RMS  = 0.06
+CLAP_ONSET    = 6.0
 CLAP_COOLDOWN = 0.4
 CLAP_WINDOW   = 2.0
 
@@ -61,8 +61,8 @@ WHISTLE_FREQ_LOW  = 1000
 WHISTLE_FREQ_HIGH = 2500
 WHISTLE_MIN_RMS   = 0.02
 WHISTLE_DOMINANCE = 8.0
-WHISTLE_MIN_DUR   = 0.4    # duración mínima para contar como silbido real
-WHISTLE_SHORT_MAX = 0.9
+WHISTLE_MIN_DUR   = 0.3    # duración mínima para contar como silbido real
+WHISTLE_SHORT_MAX = 0.6    # < 0.6s = bajar, >= 0.6s = subir
 VOLUME_STEP       = 10
 
 ACTION_COOLDOWN = 30.0
