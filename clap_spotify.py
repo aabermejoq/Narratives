@@ -228,33 +228,34 @@ class AudioDetector:
 # ── Reconocimiento de voz ─────────────────────────────────────────────────────
 
 def voice_listener(action_queue: queue.Queue, stop_event: threading.Event) -> None:
+    """Graba 4s con sounddevice (sin PyAudio) y manda a Google STT."""
     recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 300
-    recognizer.dynamic_energy_threshold = True
+    record_secs = 4
+    frames = int(SAMPLE_RATE * record_secs)
 
     log.info("Micrófono de voz listo.")
 
     while not stop_event.is_set():
-        # no empieces a escuchar mientras Jarvis habla
         if is_speaking.is_set():
-            is_speaking.wait()
-            time.sleep(0.3)
+            time.sleep(0.1)
             continue
         try:
-            with sr.Microphone() as source:
-                audio = recognizer.listen(source, timeout=2, phrase_time_limit=5)
+            # Graba usando sounddevice — sin abrir un segundo driver de audio
+            recording = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1,
+                               dtype="int16", blocking=True)
 
-            if is_speaking.is_set():   # descarta si Jarvis empezó a hablar durante la escucha
+            if is_speaking.is_set():
                 continue
 
-            text = recognizer.recognize_google(audio, language="es-ES").lower()
+            audio_data = sr.AudioData(recording.tobytes(), SAMPLE_RATE, 2)
+            text = recognizer.recognize_google(audio_data, language="es-ES").lower()
             log.info("Voz: '%s'", text)
 
             if "jarvis" not in text:
                 continue
 
             if any(w in text for w in ["buenos días", "buenos dias"]):
-                action_queue.put(f"greet")
+                action_queue.put("greet")
             elif any(w in text for w in ["adelante", "siguiente"]):
                 action_queue.put("next")
             elif any(w in text for w in ["atrás", "atras", "anterior"]):
@@ -268,8 +269,6 @@ def voice_listener(action_queue: queue.Queue, stop_event: threading.Event) -> No
             elif "baja" in text and "volumen" in text:
                 action_queue.put("volume_down")
 
-        except sr.WaitTimeoutError:
-            pass
         except sr.UnknownValueError:
             pass
         except Exception as exc:
