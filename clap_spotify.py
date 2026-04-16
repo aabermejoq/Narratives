@@ -234,11 +234,16 @@ def voice_listener(action_queue: queue.Queue, stop_event: threading.Event) -> No
     log.info("Micrófono de voz listo.")
 
     while not stop_event.is_set():
+        # no empieces a escuchar mientras Jarvis habla
+        if is_speaking.is_set():
+            is_speaking.wait()
+            time.sleep(0.3)
+            continue
         try:
             with sr.Microphone() as source:
                 audio = recognizer.listen(source, timeout=2, phrase_time_limit=5)
 
-            if is_speaking.is_set():   # descarta audio capturado mientras Jarvis hablaba
+            if is_speaking.is_set():   # descarta si Jarvis empezó a hablar durante la escucha
                 continue
 
             text = recognizer.recognize_google(audio, language="es-ES").lower()
@@ -300,6 +305,8 @@ def main() -> None:
         mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
         detector.process_chunk(mono)
 
+    # pausa de arranque para que el micrófono se estabilice
+    time.sleep(2)
     log.info("Jarvis listo. Di 'Jarvis, buenos días' para empezar.")
 
     handlers = {
@@ -339,7 +346,13 @@ def main() -> None:
                 except Exception as exc:
                     log.error("Error en '%s': %s", action, exc)
 
-                if action != "greet":
+                # espera a que termine el TTS antes de volver a escuchar
+                while is_speaking.is_set():
+                    time.sleep(0.1)
+
+                if action == "greet":
+                    time.sleep(1)  # pequeña pausa antes de escuchar de nuevo
+                else:
                     detector.block()
                     time.sleep(ACTION_COOLDOWN)
     except KeyboardInterrupt:
