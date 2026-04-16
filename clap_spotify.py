@@ -25,20 +25,20 @@ SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "TU_CLIENT_ID_AQUI")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "TU_CLIENT_SECRET_AQUI")
 SPOTIFY_REDIRECT_URI  = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
 
-# URI de la canción → botón derecho en Spotify → Compartir → Copiar URI del tema
 SPOTIFY_TRACK_URI = os.getenv(
     "SPOTIFY_TRACK_URI",
     "spotify:track:4uLU6hMCjMI75M1A2tKUQC"
 )
 
-# Detección de aplausos
-SAMPLE_RATE       = 44100   # Hz
-CHUNK_DURATION    = 0.05    # segundos por bloque de audio
-CLAP_THRESHOLD    = 0.05    # amplitud RMS mínima (0.0–1.0)
-CLAP_COOLDOWN     = 0.3     # segundos mínimos entre aplausos individuales
-CLAPS_REQUIRED    = 2       # aplausos necesarios para disparar
-CLAP_WINDOW       = 1.5     # ventana de tiempo en segundos
-PLAY_COOLDOWN     = 8.0     # segundos bloqueados tras reproducir
+# Detección — ajusta ONSET_RATIO si hace falta
+SAMPLE_RATE    = 44100
+CHUNK_DURATION = 0.04    # segundos por bloque
+MIN_RMS        = 0.03    # energía mínima absoluta (filtra silencio)
+ONSET_RATIO    = 4.0     # cuántas veces más alto que el chunk anterior = aplauso
+CLAP_COOLDOWN  = 0.4     # segundos entre aplausos individuales
+CLAPS_REQUIRED = 2       # aplausos para disparar
+CLAP_WINDOW    = 2.0     # ventana en segundos
+PLAY_COOLDOWN  = 8.0     # segundos bloqueados tras reproducir
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -75,24 +75,36 @@ def play_track(sp: spotipy.Spotify, track_uri: str) -> None:
     log.info("▶  Reproduciendo en '%s'", active["name"])
 
 
-# ── Detección de aplausos ─────────────────────────────────────────────────────
+# ── Detección de aplausos por onset ──────────────────────────────────────────
 
 class ClapDetector:
     def __init__(self) -> None:
+        self._prev_rms: float = 0.0
         self._last_clap_time: float = 0.0
         self._clap_times: list[float] = []
         self._lock = threading.Lock()
-        self._triggered = threading.Event()  # señal al hilo principal
+        self._triggered = threading.Event()
 
     def process_chunk(self, chunk: np.ndarray) -> None:
         rms = float(np.sqrt(np.mean(chunk ** 2)))
         now = time.monotonic()
 
         with self._lock:
-            if rms >= CLAP_THRESHOLD and (now - self._last_clap_time) >= CLAP_COOLDOWN:
+            prev = self._prev_rms
+            self._prev_rms = rms
+
+            # onset: pico súbito de energía por encima del umbral mínimo
+            is_clap = (
+                rms >= MIN_RMS
+                and prev > 0
+                and (rms / prev) >= ONSET_RATIO
+                and (now - self._last_clap_time) >= CLAP_COOLDOWN
+            )
+
+            if is_clap:
                 self._last_clap_time = now
                 self._clap_times.append(now)
-                log.debug("Aplauso (RMS=%.4f) total=%d", rms, len(self._clap_times))
+                log.debug("Aplauso onset rms=%.4f ratio=%.1f total=%d", rms, rms/prev, len(self._clap_times))
 
             self._clap_times = [t for t in self._clap_times if now - t <= CLAP_WINDOW]
 
@@ -101,14 +113,13 @@ class ClapDetector:
                 self._triggered.set()
 
     def wait_for_clap(self) -> None:
-        """Bloquea hasta detectar la secuencia de aplausos."""
         self._triggered.wait()
         self._triggered.clear()
 
     def reset(self) -> None:
-        """Limpia todo el estado acumulado durante el cooldown."""
         with self._lock:
             self._clap_times.clear()
+            self._prev_rms = 0.0
             self._last_clap_time = time.monotonic()
         self._triggered.clear()
 
@@ -136,9 +147,8 @@ def main() -> None:
         detector.process_chunk(mono)
 
     log.info(
-        "Escuchando… aplaude %d veces en %.1fs para reproducir. (Ctrl+C para salir)",
+        "Escuchando… aplaude %d veces para reproducir. (Ctrl+C para salir)",
         CLAPS_REQUIRED,
-        CLAP_WINDOW,
     )
 
     try:
@@ -156,8 +166,7 @@ def main() -> None:
                     play_track(sp, SPOTIFY_TRACK_URI)
                 except Exception as exc:
                     log.error("Error al reproducir: %s", exc)
-                # bloquea detección durante PLAY_COOLDOWN segundos
-                log.info("Esperando %.0fs antes de escuchar de nuevo…", PLAY_COOLDOWN)
+                log.info("Bloqueado %.0fs…", PLAY_COOLDOWN)
                 time.sleep(PLAY_COOLDOWN)
                 detector.reset()
     except KeyboardInterrupt:
