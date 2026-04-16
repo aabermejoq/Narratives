@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import logging
+import threading
 import numpy as np
 import sounddevice as sd
 import spotipy
@@ -87,26 +88,26 @@ class ClapDetector:
         self._last_clap_time: float = 0.0
         self._last_play_time: float = 0.0
         self._clap_times: list[float] = []
+        self._lock = threading.Lock()
 
     def process_chunk(self, chunk: np.ndarray) -> bool:
         """Devuelve True cuando se detecta la secuencia de aplausos requerida."""
         rms = float(np.sqrt(np.mean(chunk ** 2)))
         now = time.monotonic()
 
-        # Espera el cooldown entre aplausos
-        if rms >= CLAP_THRESHOLD and (now - self._last_clap_time) >= CLAP_COOLDOWN:
-            self._last_clap_time = now
-            self._clap_times.append(now)
-            log.debug("Aplauso detectado (RMS=%.4f)", rms)
+        with self._lock:
+            if rms >= CLAP_THRESHOLD and (now - self._last_clap_time) >= CLAP_COOLDOWN:
+                self._last_clap_time = now
+                self._clap_times.append(now)
+                log.debug("Aplauso detectado (RMS=%.4f)", rms)
 
-        # Elimina aplausos fuera de la ventana de tiempo
-        self._clap_times = [t for t in self._clap_times if now - t <= CLAP_WINDOW]
+            self._clap_times = [t for t in self._clap_times if now - t <= CLAP_WINDOW]
 
-        if len(self._clap_times) >= CLAPS_REQUIRED:
-            self._clap_times.clear()
-            if (now - self._last_play_time) >= PLAY_COOLDOWN:
-                self._last_play_time = now
-                return True
+            if len(self._clap_times) >= CLAPS_REQUIRED:
+                self._clap_times.clear()
+                if (now - self._last_play_time) >= PLAY_COOLDOWN:
+                    self._last_play_time = now
+                    return True
 
         return False
 
