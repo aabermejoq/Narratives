@@ -78,10 +78,10 @@ log = logging.getLogger("jarvis")
 # ── TTS ───────────────────────────────────────────────────────────────────────
 
 _tts_queue: queue.Queue = queue.Queue()
+is_speaking = threading.Event()   # True mientras Jarvis habla → mic ignorado
 
 def _tts_worker() -> None:
     engine = pyttsx3.init()
-    # Busca voz en español
     for voice in engine.getProperty("voices"):
         if "spanish" in voice.name.lower() or "es_" in voice.id.lower():
             engine.setProperty("voice", voice.id)
@@ -91,8 +91,11 @@ def _tts_worker() -> None:
         text = _tts_queue.get()
         if text is None:
             break
+        is_speaking.set()
         engine.say(text)
         engine.runAndWait()
+        time.sleep(0.5)   # margen extra para que el eco se disipe
+        is_speaking.clear()
 
 def speak(text: str) -> None:
     log.info("🔊  %s", text)
@@ -234,6 +237,10 @@ def voice_listener(action_queue: queue.Queue, stop_event: threading.Event) -> No
         try:
             with sr.Microphone() as source:
                 audio = recognizer.listen(source, timeout=2, phrase_time_limit=5)
+
+            if is_speaking.is_set():   # descarta audio capturado mientras Jarvis hablaba
+                continue
+
             text = recognizer.recognize_google(audio, language="es-ES").lower()
             log.info("Voz: '%s'", text)
 
@@ -319,11 +326,19 @@ def main() -> None:
                     action = action_queue.get(timeout=1)
                 except queue.Empty:
                     continue
+                # vacía cola para evitar acumulación
+                while not action_queue.empty():
+                    try:
+                        action_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
                 log.info("Acción: %s", action)
                 try:
                     handlers[action]()
                 except Exception as exc:
                     log.error("Error en '%s': %s", action, exc)
+
                 if action != "greet":
                     detector.block()
                     time.sleep(ACTION_COOLDOWN)
